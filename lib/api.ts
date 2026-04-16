@@ -79,13 +79,25 @@ export async function fetchAllRegions(): Promise<AllRegionsForecast> {
     const res = await fetch(`${BASE}/api/forecast/all-regions`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({}),   // backend uses latest CSV data automatically
+        body: JSON.stringify({}),
     });
     if (!res.ok) {
         const err = await res.json().catch(() => ({ detail: res.statusText }));
         throw new Error(err.detail || `HTTP ${res.status}`);
     }
     return res.json();
+}
+
+/** Fetch forecast + capacity together for the dashboard. */
+export async function fetchDashboardData(): Promise<{
+    forecast: AllRegionsForecast;
+    capacity: AllRegionsCapacity;
+}> {
+    const [forecast, capacity] = await Promise.all([
+        fetchAllRegions(),
+        fetchAllRegionsCapacity(),
+    ]);
+    return { forecast, capacity };
 }
 
 /** Check model + data status. */
@@ -100,6 +112,58 @@ export async function fetchRecentDemand(regionCol?: string, hours = 168) {
     const params = new URLSearchParams({ hours: String(hours) });
     if (regionCol) params.set("region", regionCol);
     const res = await fetch(`${BASE}/api/demand/recent?${params}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+}
+
+// ── Dynamic Capacity Types ────────────────────────────────────────────────────
+
+export interface CapacityHour {
+    hour: number;
+    label: string;
+    total_capacity_mw: number;
+    solar_cf: number;
+    wind_cf: number;
+    hydro_cf: number;
+    thermal_cf: number;
+    breakdown_mw: Record<string, number>;
+    alerts: string[];
+}
+
+export interface RegionCapacity {
+    total_available_mw: number;
+    installed_total_mw: number;
+    renewable_mw: number;
+    thermal_mw: number;
+    breakdown_mw: Record<string, number>;
+    capacity_factors: Record<string, number>;
+    alerts: string[];
+}
+
+export interface AllRegionsCapacity {
+    timestamp_ist: string;
+    hour: number;
+    month: number;
+    regions: Record<string, RegionCapacity>;
+    all_india: {
+        total_available_mw: number;
+        installed_mw: number;
+        renewable_mw: number;
+        thermal_mw: number;
+        renewable_pct: number;
+    };
+}
+
+export async function fetchAllRegionsCapacity(): Promise<AllRegionsCapacity> {
+    const res = await fetch(`${BASE}/api/capacity/all-regions`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+}
+
+export async function fetchCapacity24h(region: string, month?: number): Promise<{ region: string; month: number; hours: CapacityHour[] }> {
+    const params = new URLSearchParams({ region });
+    if (month) params.set("month", String(month));
+    const res = await fetch(`${BASE}/api/capacity/24h?${params}`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return res.json();
 }

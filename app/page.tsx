@@ -325,6 +325,62 @@ export default function DashboardPage() {
                 <MetricCard label="Renewable Share"   value={renewablePct>0?`${renewablePct}%`:"—"}                         sub="Of available capacity now" accent="teal" />
             </div>
 
+            {/* ── Overload Alert Banner + DR Actions ───────────────────── */}
+            {forecastData && totalOverload > 0 && (
+                <div style={{marginBottom:14}}>
+                    {/* Alert banner */}
+                    <div style={{background:"rgba(255,77,106,0.08)",border:"1px solid rgba(255,77,106,0.3)",borderRadius:8,padding:"12px 16px",marginBottom:10,display:"flex",alignItems:"flex-start",gap:10}}>
+                        <div style={{width:18,height:18,borderRadius:"50%",background:"#ff4d6a",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:700,color:"#fff",flexShrink:0,marginTop:1}}>!</div>
+                        <div>
+                            <div style={{fontSize:12,fontWeight:500,color:"#ff4d6a",marginBottom:4}}>
+                                ⚠ Grid Overload Detected — {totalOverload} Region{totalOverload>1?"s":""} at Risk
+                            </div>
+                            <div style={{fontSize:11,color:"rgba(232,244,241,0.65)",lineHeight:1.6}}>
+                                {REGIONS.filter(r=>forecastData?.regions?.[r.col]?.overload_summary?.overload_detected).map(r=>{
+                                    const os = forecastData.regions[r.col].overload_summary;
+                                    return (
+                                        <span key={r.col} style={{marginRight:16}}>
+                      <span style={{color:r.color}}>{r.label}:</span>
+                                            {" "}{os.total_overload_hours}h overloaded · peak {(os.peak_predicted_mw/1000).toFixed(1)} GW
+                                            {os.excess_mw > 0 && <span style={{color:"#ff4d6a"}}> (+{(os.excess_mw/1000).toFixed(1)} GW excess)</span>}
+                    </span>
+                                    );
+                                })}
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* DR Actions summary across all overloaded regions */}
+                    <div style={{background:"rgba(255,255,255,0.025)",border:"1px solid rgba(255,255,255,0.07)",borderRadius:8,padding:14}}>
+                        <div style={{fontSize:10,color:"rgba(232,244,241,0.45)",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:12}}>
+                            Demand Response Actions — Active Recommendations
+                        </div>
+                        <div style={{display:"grid",gridTemplateColumns:"repeat(2,1fr)",gap:8}}>
+                            {REGIONS.filter(r=>forecastData?.regions?.[r.col]?.overload_summary?.overload_detected).flatMap(r=>{
+                                const actions = forecastData.regions[r.col].demand_response.actions;
+                                return actions.map((a:any,i:number)=>(
+                                    <div key={`${r.col}-${i}`} style={{
+                                        background:a.impact_level==="high"?"rgba(255,77,106,0.07)":a.impact_level==="medium"?"rgba(255,179,71,0.06)":"rgba(0,212,170,0.05)",
+                                        border:`1px solid ${a.impact_level==="high"?"rgba(255,77,106,0.25)":a.impact_level==="medium"?"rgba(255,179,71,0.2)":"rgba(0,212,170,0.2)"}`,
+                                        borderRadius:6,padding:"9px 12px",borderLeft:`3px solid ${a.impact_level==="high"?"#ff4d6a":a.impact_level==="medium"?"#ffb347":"#00d4aa"}`,
+                                    }}>
+                                        <div style={{display:"flex",justifyContent:"space-between",marginBottom:3}}>
+                                            <span style={{fontSize:11,fontWeight:500,color:"#e8f4f1"}}>{a.name}</span>
+                                            <span style={{fontFamily:"monospace",fontSize:10,color:r.color}}>{r.short}</span>
+                                        </div>
+                                        <div style={{fontSize:10,color:"rgba(232,244,241,0.5)",lineHeight:1.4,marginBottom:3}}>{a.description}</div>
+                                        <div style={{fontFamily:"monospace",fontSize:10,color:a.type==="supply"?"#ff4d6a":"#00d4aa"}}>
+                                            {a.type==="supply"?`+${a.reduction_mw.toLocaleString()} MW supply`:`−${a.reduction_mw.toLocaleString()} MW demand`}
+                                            {a.cost_inr!==0&&<span style={{color:"rgba(232,244,241,0.35)",marginLeft:8}}>₹{Math.abs(a.cost_inr).toLocaleString()}</span>}
+                                        </div>
+                                    </div>
+                                ));
+                            })}
+                        </div>
+                    </div>
+                </div>
+            )}
+
             {/* All-India capacity breakdown */}
             {capData && (
                 <div style={{...S.panel, marginBottom:14}}>

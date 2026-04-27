@@ -5,6 +5,7 @@ import {
     fetchDashboardData, fetchForecastStatus,
     type AllRegionsForecast, type AllRegionsCapacity,
     type ForecastStatus, type RegionResult,
+    type CustomForecastInput,
 } from "../lib/api";
 import { MetricCard } from "../components/MetricCard";
 import { DemandChart } from "../components/DemandChart";
@@ -224,18 +225,33 @@ export default function DashboardPage() {
     const [error, setError]           = useState<string|null>(null);
     const [selected, setSelected]     = useState<string|null>(null);
     const [lastRefresh, setLastRefresh] = useState("");
+    const [isCustomMode, setCustomMode] = useState(false);
+    const [customPanelOpen, setCustomPanel] = useState(false);
+    const [forecastDate, setForecastDate]   = useState(() => {
+        const d = new Date(); d.setHours(d.getHours()+1,0,0,0);
+        return d.toISOString().slice(0,16);
+    });
+    // Per-region raw text input (user pastes comma-separated MW values)
+    const [customInputs, setCustomInputs] = useState<Record<string,string>>({});
+    const [inputErrors, setInputErrors]   = useState<Record<string,string>>({});
 
-    const load = async () => {
+    const parseRegionInput = (raw: string): number[] | null => {
+        const vals = raw.split(/[\s,\n\r]+/).map(s=>s.trim()).filter(Boolean).map(Number);
+        if (vals.some(isNaN) || vals.length < 168) return null;
+        return vals.slice(0, 168);
+    };
+
+    const load = async (customInput?: CustomForecastInput) => {
         try {
             setLoading(true);
             setError(null);
             const st = await fetchForecastStatus().catch(()=>null);
             setStatus(st);
             if (st?.all_models_ready) {
-                const {forecast, capacity} = await fetchDashboardData();
+                const {forecast, capacity} = await fetchDashboardData(customInput);
                 setForecast(forecast);
                 setCap(capacity);
-                setLastRefresh(new Date().toLocaleTimeString());
+                setLastRefresh(new Date().toLocaleTimeString() + (customInput ? " (custom)" : ""));
             }
         } catch(e:any) {
             setError(e.message);
@@ -244,7 +260,37 @@ export default function DashboardPage() {
         }
     };
 
-    useEffect(()=>{ load(); const iv=setInterval(load,5*60*1000); return()=>clearInterval(iv); },[]);
+    const runCustomForecast = () => {
+        const errors: Record<string,string> = {};
+        const input: CustomForecastInput = { start_datetime: new Date(forecastDate).toISOString() };
+        let anyProvided = false;
+        REGIONS.forEach(r => {
+            const raw = customInputs[r.col]?.trim();
+            if (!raw) return;
+            const vals = parseRegionInput(raw);
+            if (!vals) {
+                errors[r.col] = `Need exactly 168 numeric values (got ${raw.split(/[\s,\n\r]+/).filter(Boolean).length})`;
+                return;
+            }
+            (input as any)[r.col] = vals;
+            anyProvided = true;
+        });
+        setInputErrors(errors);
+        if (Object.keys(errors).length > 0) return;
+        if (!anyProvided) { setError("Enter at least one region's data or use Auto mode."); return; }
+        setCustomMode(true);
+        setCustomPanel(false);
+        load(input);
+    };
+
+    const resetToAuto = () => {
+        setCustomMode(false);
+        setCustomInputs({});
+        setInputErrors({});
+        load();
+    };
+
+    useEffect(()=>{ load(); const iv=setInterval(()=>{ if(!isCustomMode) load(); },5*60*1000); return()=>clearInterval(iv); },[]);
 
     const rootStyle: React.CSSProperties = {
         minHeight:"100vh",background:"#0a0f14",color:"#e8f4f1",
@@ -308,6 +354,138 @@ export default function DashboardPage() {
                         {loading?"…":"Refresh"}
                     </button>
                 </div>
+            </div>
+
+            {/* ── Custom Input Panel ─────────────────────────────────────────────── */}
+            <div style={{marginBottom:14}}>
+                {/* Mode indicator bar */}
+                <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:customPanelOpen?0:0}}>
+                    <div style={{
+                        display:"flex",alignItems:"center",gap:6,padding:"6px 14px",borderRadius:6,
+                        background:isCustomMode?"rgba(255,179,71,0.1)":"rgba(0,212,170,0.06)",
+                        border:`1px solid ${isCustomMode?"rgba(255,179,71,0.35)":"rgba(0,212,170,0.2)"}`,
+                        fontSize:11,color:isCustomMode?"#ffb347":"#00d4aa",
+                    }}>
+                        <span>{isCustomMode?"📝 Custom forecast mode":"🔄 Auto mode — using last 7 days from dataset"}</span>
+                        {isCustomMode && (
+                            <button onClick={resetToAuto} style={{
+                                marginLeft:8,background:"transparent",border:"1px solid rgba(255,179,71,0.4)",
+                                color:"#ffb347",borderRadius:4,padding:"2px 8px",fontSize:10,cursor:"pointer",
+                            }}>Reset to Auto</button>
+                        )}
+                    </div>
+                    <button onClick={()=>setCustomPanel(p=>!p)} style={{
+                        background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.1)",
+                        color:"rgba(232,244,241,0.7)",borderRadius:6,padding:"6px 14px",
+                        fontFamily:"monospace",fontSize:10,cursor:"pointer",
+                        display:"flex",alignItems:"center",gap:6,
+                    }}>
+                        {customPanelOpen?"▲ Hide":"▼ Enter Custom Historical Data"}
+                    </button>
+                </div>
+
+                {/* Collapsible panel */}
+                {customPanelOpen && (
+                    <div style={{
+                        marginTop:10,background:"rgba(255,255,255,0.025)",
+                        border:"1px solid rgba(255,179,71,0.25)",borderRadius:10,padding:18,
+                    }}>
+                        <div style={{fontSize:13,fontWeight:500,color:"#ffb347",marginBottom:4}}>
+                            Custom Historical Data — Predict Next 24 Hours
+                        </div>
+                        <div style={{fontSize:11,color:"rgba(232,244,241,0.5)",marginBottom:16,lineHeight:1.6}}>
+                            Paste <strong style={{color:"#ffb347"}}>exactly 168 comma-separated MW values</strong> per region
+                            (= last 7 days × 24 hours, chronological). Leave blank to use the last 7 days from the dataset.
+                            You only need to fill the regions you care about — others will use auto data.
+                        </div>
+
+                        {/* Forecast date */}
+                        <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:16}}>
+                            <label style={{fontSize:11,color:"rgba(232,244,241,0.6)",whiteSpace:"nowrap"}}>
+                                Forecast start (IST):
+                            </label>
+                            <input type="datetime-local" value={forecastDate}
+                                   onChange={e=>setForecastDate(e.target.value)}
+                                   style={{
+                                       background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.15)",
+                                       color:"#e8f4f1",borderRadius:6,padding:"5px 10px",
+                                       fontFamily:"monospace",fontSize:11,
+                                   }} />
+                            <span style={{fontSize:10,color:"rgba(232,244,241,0.35)"}}>
+                Model will forecast 24h starting from this hour
+              </span>
+                        </div>
+
+                        {/* Per-region inputs */}
+                        <div style={{display:"grid",gridTemplateColumns:"repeat(5,minmax(0,1fr))",gap:12,marginBottom:16}}>
+                            {REGIONS.map(r=>(
+                                <div key={r.col}>
+                                    <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:5}}>
+                                        <div style={{width:8,height:8,borderRadius:2,background:r.color,flexShrink:0}} />
+                                        <span style={{fontSize:11,fontWeight:500,color:r.color}}>{r.label}</span>
+                                        <span style={{fontSize:9,color:"rgba(232,244,241,0.35)",marginLeft:"auto"}}>{r.capacity/1000} GW cap</span>
+                                    </div>
+                                    <textarea
+                                        rows={4}
+                                        placeholder={`168 hourly MW values\ne.g. 62400, 61800, 60900...\n(leave blank = auto)`}
+                                        value={customInputs[r.col]||""}
+                                        onChange={e=>setCustomInputs(p=>({...p,[r.col]:e.target.value}))}
+                                        style={{
+                                            width:"100%",boxSizing:"border-box",
+                                            background:"rgba(255,255,255,0.04)",
+                                            border:`1px solid ${inputErrors[r.col]?"rgba(255,77,106,0.5)":customInputs[r.col]?"rgba(255,179,71,0.35)":"rgba(255,255,255,0.1)"}`,
+                                            color:"#e8f4f1",borderRadius:6,padding:"7px 10px",
+                                            fontFamily:"monospace",fontSize:9,resize:"vertical",outline:"none",
+                                        }}
+                                    />
+                                    {customInputs[r.col] && !inputErrors[r.col] && (()=>{
+                                        const cnt = customInputs[r.col].split(/[\s,\n\r]+/).filter(Boolean).length;
+                                        return (
+                                            <div style={{fontSize:9,marginTop:3,color:cnt>=168?"#00d4aa":"#ffb347",fontFamily:"monospace"}}>
+                                                {cnt} / 168 values {cnt>=168?"✓":"— need more"}
+                                            </div>
+                                        );
+                                    })()}
+                                    {inputErrors[r.col] && (
+                                        <div style={{fontSize:9,marginTop:3,color:"#ff4d6a"}}>{inputErrors[r.col]}</div>
+                                    )}
+                                </div>
+                            ))}
+                        </div>
+
+                        {/* Quick fill helper */}
+                        <div style={{
+                            padding:"10px 14px",background:"rgba(0,212,170,0.04)",
+                            border:"1px solid rgba(0,212,170,0.15)",borderRadius:6,marginBottom:14,
+                            fontSize:10,color:"rgba(232,244,241,0.5)",lineHeight:1.7,
+                        }}>
+                            <strong style={{color:"#00d4aa"}}>💡 Quick tip:</strong> To get 168 values from your own data,
+                            export the last 7 days of hourly demand from your SCADA or SLDC portal as CSV, then
+                            copy the MW column values (one row = one hour, oldest first).
+                            Typical ranges: Northern 55,000–92,000 MW · Western 65,000–105,000 MW ·
+                            Southern 45,000–78,000 MW · Eastern 25,000–48,000 MW · NE 1,500–3,800 MW
+                        </div>
+
+                        <div style={{display:"flex",gap:10,alignItems:"center"}}>
+                            <button onClick={runCustomForecast} disabled={loading} style={{
+                                background:loading?"rgba(255,179,71,0.2)":"rgba(255,179,71,0.15)",
+                                border:"1px solid rgba(255,179,71,0.5)",color:"#ffb347",
+                                borderRadius:6,padding:"8px 20px",fontFamily:"monospace",
+                                fontSize:11,cursor:loading?"not-allowed":"pointer",fontWeight:500,
+                            }}>
+                                {loading?"Running…":"⚡ Run Custom Forecast"}
+                            </button>
+                            <button onClick={()=>setCustomPanel(false)} style={{
+                                background:"transparent",border:"1px solid rgba(255,255,255,0.1)",
+                                color:"rgba(232,244,241,0.4)",borderRadius:6,padding:"8px 16px",
+                                fontFamily:"monospace",fontSize:11,cursor:"pointer",
+                            }}>Cancel</button>
+                            <span style={{fontSize:10,color:"rgba(232,244,241,0.3)",marginLeft:4}}>
+                Regions with no input use the last 7 days from data/demand.csv automatically
+              </span>
+                        </div>
+                    </div>
+                )}
             </div>
 
             {status&&(!status.all_models_ready||!status.data_file)&&<SetupBanner status={status} />}

@@ -480,7 +480,7 @@ export default function SimulationPage() {
                             {[
                                 {color:"#ff4d6a",    label:"Original demand"},
                                 {color:"#00d4aa",    label:"Adjusted demand"},
-                                {color:"rgba(255,77,106,0.5)",label:"Dynamic capacity (varies hourly)"},
+                                {color:"#a78bfa",    label:"Dynamic capacity (varies hourly)"},
                             ].map(l=>(
                                 <div key={l.label} style={{display:"flex",alignItems:"center",gap:5,fontSize:10,color:"rgba(232,244,241,0.5)"}}>
                                     <div style={{width:14,height:2,background:l.color}} />{l.label}
@@ -495,7 +495,7 @@ export default function SimulationPage() {
                                 <Tooltip content={<Tip />} />
                                 <Area  type="monotone" dataKey="Original"         stroke="#ff4d6a" fill="rgba(255,77,106,0.07)" strokeWidth={2} dot={false} />
                                 <Line  type="monotone" dataKey="Adjusted"         stroke="#00d4aa" strokeWidth={2.5} dot={false} />
-                                <Line  type="monotone" dataKey="Dynamic Capacity" stroke="rgba(255,77,106,0.55)" strokeWidth={1.5} strokeDasharray="5 3" dot={false} />
+                                <Line  type="monotone" dataKey="Dynamic Capacity" stroke="#a78bfa" strokeWidth={2} strokeDasharray="6 3" dot={false} />
                             </ComposedChart>
                         </ResponsiveContainer>
                         <div style={{fontSize:10,color:"rgba(232,244,241,0.35)",marginTop:6}}>

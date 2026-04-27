@@ -74,12 +74,29 @@ export interface ForecastStatus {
 
 // ── API calls ─────────────────────────────────────────────────────────────────
 
-/** Fetch 24h forecast for all 5 regions + national in one call. */
-export async function fetchAllRegions(): Promise<AllRegionsForecast> {
+export interface CustomForecastInput {
+    // 168 hourly MW values per region (last 7 days).
+    // If omitted the backend uses the last 168 rows of data/demand.csv.
+    Northern_Region_mw?:     number[];
+    Western_Region_mw?:      number[];
+    Eastern_Region_mw?:      number[];
+    Southern_Region_mw?:     number[];
+    NorthEastern_Region_mw?: number[];
+    demand_mw?:              number[];
+    // ISO datetime for the first forecast hour (default: now rounded to hour)
+    start_datetime?: string;
+}
+
+/** Fetch 24h forecast for all 5 regions + national in one call.
+ *  Pass customInput to override the default "use last CSV data" behaviour. */
+export async function fetchAllRegions(
+    customInput?: CustomForecastInput
+): Promise<AllRegionsForecast> {
+    const body = customInput ?? {};
     const res = await fetch(`${BASE}/api/forecast/all-regions`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({}),
+        body: JSON.stringify(body),
     });
     if (!res.ok) {
         const err = await res.json().catch(() => ({ detail: res.statusText }));
@@ -88,13 +105,16 @@ export async function fetchAllRegions(): Promise<AllRegionsForecast> {
     return res.json();
 }
 
-/** Fetch forecast + capacity together for the dashboard. */
-export async function fetchDashboardData(): Promise<{
+/** Fetch forecast + capacity together for the dashboard.
+ *  Pass customInput to run a forecast from user-supplied historical data. */
+export async function fetchDashboardData(
+    customInput?: CustomForecastInput
+): Promise<{
     forecast: AllRegionsForecast;
     capacity: AllRegionsCapacity;
 }> {
     const [forecast, capacity] = await Promise.all([
-        fetchAllRegions(),
+        fetchAllRegions(customInput),
         fetchAllRegionsCapacity(),
     ]);
     return { forecast, capacity };

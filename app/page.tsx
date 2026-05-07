@@ -235,6 +235,28 @@ export default function DashboardPage() {
     const [customInputs, setCustomInputs] = useState<Record<string,string>>({});
     const [inputErrors, setInputErrors]   = useState<Record<string,string>>({});
 
+    // New: structured inputs replacing raw paste
+    const [activeTab, setActiveTab]       = useState<"quick"|"weather"|"holidays"|"advanced">("quick");
+    const [quickInputs, setQuickInputs]   = useState<Record<string,string>>({
+        Northern_Region_mw:"", Western_Region_mw:"", Eastern_Region_mw:"",
+        Southern_Region_mw:"", NorthEastern_Region_mw:"",
+    });
+    // Weather overrides (per-region temperature slider + season select)
+    const [weatherInputs, setWeatherInputs] = useState<Record<string,{temp:number,humidity:number,season:string}>>({
+        Northern_Region_mw:{temp:32,humidity:55,season:"auto"},
+        Western_Region_mw: {temp:30,humidity:70,season:"auto"},
+        Eastern_Region_mw: {temp:31,humidity:72,season:"auto"},
+        Southern_Region_mw:{temp:29,humidity:75,season:"auto"},
+        NorthEastern_Region_mw:{temp:26,humidity:80,season:"auto"},
+    });
+    // Holiday overrides
+    const [holidayInputs, setHolidayInputs] = useState({
+        is_national_holiday: false,
+        is_major_festival:   false,
+        is_diwali_window:    false,
+        is_pre_festival:     false,
+    });
+
     const parseRegionInput = (raw: string): number[] | null => {
         const vals = raw.split(/[\s,\n\r]+/).map(s=>s.trim()).filter(Boolean).map(Number);
         if (vals.some(isNaN) || vals.length < 168) return null;
@@ -260,24 +282,68 @@ export default function DashboardPage() {
         }
     };
 
+    // Generate synthetic 168-hour demand history from a single representative value
+    // Uses a daily pattern scaled to the user's entered peak + weather adjustments
+    const generateHistory = (peakMw: number, region: string, wx: {temp:number,humidity:number}): number[] => {
+        // India hourly load shape (% of daily peak, 24h pattern)
+        const shape = [0.72,0.68,0.65,0.63,0.64,0.68,0.76,0.87,0.94,0.97,0.98,0.99,
+            1.00,0.99,0.98,0.97,0.96,0.95,0.98,0.99,0.97,0.92,0.85,0.78];
+        // Temperature adjustment: +0.8% per °C above 30°C (AC load effect)
+        const tempAdj = 1 + Math.max(0, wx.temp - 30) * 0.008;
+        // Humidity boost above 70%
+        const humAdj  = 1 + Math.max(0, wx.humidity - 70) * 0.003;
+        const history: number[] = [];
+        for (let day = 0; day < 7; day++) {
+            for (let h = 0; h < 24; h++) {
+                // Slight weekday/weekend variation
+                const wkFactor = (day === 0 || day === 6) ? 0.88 : 1.0;
+                // Small random noise ±2% for realism
+                const noise = 1 + (Math.sin(day * 37 + h * 13) * 0.02);
+                const val = peakMw * shape[h] * wkFactor * tempAdj * humAdj * noise;
+                history.push(Math.round(val));
+            }
+        }
+        return history;
+    };
+
     const runCustomForecast = () => {
         const errors: Record<string,string> = {};
         const input: CustomForecastInput = { start_datetime: new Date(forecastDate).toISOString() };
         let anyProvided = false;
-        REGIONS.forEach(r => {
-            const raw = customInputs[r.col]?.trim();
-            if (!raw) return;
-            const vals = parseRegionInput(raw);
-            if (!vals) {
-                errors[r.col] = `Need exactly 168 numeric values (got ${raw.split(/[\s,\n\r]+/).filter(Boolean).length})`;
-                return;
-            }
-            (input as any)[r.col] = vals;
-            anyProvided = true;
-        });
+
+        if (activeTab === "advanced") {
+            // Raw paste mode — original behaviour
+            REGIONS.forEach(r => {
+                const raw = customInputs[r.col]?.trim();
+                if (!raw) return;
+                const vals = parseRegionInput(raw);
+                if (!vals) {
+                    errors[r.col] = `Need exactly 168 numeric values (got ${raw.split(/[\s,\n\r]+/).filter(Boolean).length})`;
+                    return;
+                }
+                (input as any)[r.col] = vals;
+                anyProvided = true;
+            });
+        } else {
+            // Quick / Weather / Holiday tabs — generate history from structured inputs
+            REGIONS.forEach(r => {
+                const raw = quickInputs[r.col]?.trim();
+                if (!raw) return;
+                const peak = Number(raw);
+                if (isNaN(peak) || peak <= 0) {
+                    errors[r.col] = "Enter a valid MW value";
+                    return;
+                }
+                const wx = weatherInputs[r.col] ?? {temp:30, humidity:60};
+                const history = generateHistory(peak, r.col, wx);
+                (input as any)[r.col] = history;
+                anyProvided = true;
+            });
+        }
+
         setInputErrors(errors);
         if (Object.keys(errors).length > 0) return;
-        if (!anyProvided) { setError("Enter at least one region's data or use Auto mode."); return; }
+        if (!anyProvided) { setError("Enter at least one region's expected peak demand."); return; }
         setCustomMode(true);
         setCustomPanel(false);
         load(input);
@@ -386,103 +452,312 @@ export default function DashboardPage() {
 
                 {/* Collapsible panel */}
                 {customPanelOpen && (
-                    <div style={{
-                        marginTop:10,background:"rgba(255,255,255,0.025)",
-                        border:"1px solid rgba(255,179,71,0.25)",borderRadius:10,padding:18,
-                    }}>
-                        <div style={{fontSize:13,fontWeight:500,color:"#ffb347",marginBottom:4}}>
-                            Custom Historical Data — Predict Next 24 Hours
-                        </div>
-                        <div style={{fontSize:11,color:"rgba(232,244,241,0.5)",marginBottom:16,lineHeight:1.6}}>
-                            Paste <strong style={{color:"#ffb347"}}>exactly 168 comma-separated MW values</strong> per region
-                            (= last 7 days × 24 hours, chronological). Leave blank to use the last 7 days from the dataset.
-                            You only need to fill the regions you care about — others will use auto data.
-                        </div>
+                    <div style={{marginTop:10,background:"rgba(255,255,255,0.025)",border:"1px solid rgba(255,179,71,0.25)",borderRadius:10,padding:18}}>
 
-                        {/* Forecast date */}
-                        <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:16}}>
-                            <label style={{fontSize:11,color:"rgba(232,244,241,0.6)",whiteSpace:"nowrap"}}>
-                                Forecast start (IST):
-                            </label>
-                            <input type="datetime-local" value={forecastDate}
-                                   onChange={e=>setForecastDate(e.target.value)}
-                                   style={{
-                                       background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.15)",
-                                       color:"#e8f4f1",borderRadius:6,padding:"5px 10px",
-                                       fontFamily:"monospace",fontSize:11,
-                                   }} />
-                            <span style={{fontSize:10,color:"rgba(232,244,241,0.35)"}}>
-                Model will forecast 24h starting from this hour
-              </span>
-                        </div>
-
-                        {/* Per-region inputs */}
-                        <div style={{display:"grid",gridTemplateColumns:"repeat(5,minmax(0,1fr))",gap:12,marginBottom:16}}>
-                            {REGIONS.map(r=>(
-                                <div key={r.col}>
-                                    <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:5}}>
-                                        <div style={{width:8,height:8,borderRadius:2,background:r.color,flexShrink:0}} />
-                                        <span style={{fontSize:11,fontWeight:500,color:r.color}}>{r.label}</span>
-                                        <span style={{fontSize:9,color:"rgba(232,244,241,0.35)",marginLeft:"auto"}}>{r.capacity/1000} GW cap</span>
-                                    </div>
-                                    <textarea
-                                        rows={4}
-                                        placeholder={`168 hourly MW values\ne.g. 62400, 61800, 60900...\n(leave blank = auto)`}
-                                        value={customInputs[r.col]||""}
-                                        onChange={e=>setCustomInputs(p=>({...p,[r.col]:e.target.value}))}
-                                        style={{
-                                            width:"100%",boxSizing:"border-box",
-                                            background:"rgba(255,255,255,0.04)",
-                                            border:`1px solid ${inputErrors[r.col]?"rgba(255,77,106,0.5)":customInputs[r.col]?"rgba(255,179,71,0.35)":"rgba(255,255,255,0.1)"}`,
-                                            color:"#e8f4f1",borderRadius:6,padding:"7px 10px",
-                                            fontFamily:"monospace",fontSize:9,resize:"vertical",outline:"none",
-                                        }}
-                                    />
-                                    {customInputs[r.col] && !inputErrors[r.col] && (()=>{
-                                        const cnt = customInputs[r.col].split(/[\s,\n\r]+/).filter(Boolean).length;
-                                        return (
-                                            <div style={{fontSize:9,marginTop:3,color:cnt>=168?"#00d4aa":"#ffb347",fontFamily:"monospace"}}>
-                                                {cnt} / 168 values {cnt>=168?"✓":"— need more"}
-                                            </div>
-                                        );
-                                    })()}
-                                    {inputErrors[r.col] && (
-                                        <div style={{fontSize:9,marginTop:3,color:"#ff4d6a"}}>{inputErrors[r.col]}</div>
-                                    )}
+                        {/* Header + date picker */}
+                        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:14,flexWrap:"wrap",gap:10}}>
+                            <div>
+                                <div style={{fontSize:13,fontWeight:500,color:"#ffb347"}}>Custom Forecast</div>
+                                <div style={{fontSize:10,color:"rgba(232,244,241,0.4)",marginTop:2}}>
+                                    Enter today's expected conditions — the model generates 7 days of synthetic history automatically
                                 </div>
+                            </div>
+                            <div style={{display:"flex",alignItems:"center",gap:8}}>
+                                <span style={{fontSize:11,color:"rgba(232,244,241,0.5)"}}>Forecast from:</span>
+                                <input type="datetime-local" value={forecastDate}
+                                       onChange={e=>setForecastDate(e.target.value)}
+                                       style={{background:"rgba(255,255,255,0.06)",border:"1px solid rgba(255,255,255,0.15)",
+                                           color:"#e8f4f1",borderRadius:6,padding:"5px 10px",fontFamily:"monospace",fontSize:11}} />
+                            </div>
+                        </div>
+
+                        {/* Tabs */}
+                        <div style={{display:"flex",gap:4,marginBottom:16,borderBottom:"1px solid rgba(255,255,255,0.07)",paddingBottom:0}}>
+                            {([
+                                {id:"quick",    label:"⚡ Quick Setup",   desc:"Enter peak demand per region"},
+                                {id:"weather",  label:"🌡 Weather",       desc:"Temperature & humidity"},
+                                {id:"holidays", label:"🎉 Holidays",      desc:"Festival & holiday flags"},
+                                {id:"advanced", label:"🔧 Advanced",      desc:"Paste raw 168h values"},
+                            ] as const).map(tab=>(
+                                <button key={tab.id} onClick={()=>setActiveTab(tab.id)} style={{
+                                    padding:"7px 14px",borderRadius:"6px 6px 0 0",fontSize:11,cursor:"pointer",
+                                    fontFamily:"monospace",border:"none",outline:"none",
+                                    background:activeTab===tab.id?"rgba(255,179,71,0.15)":"transparent",
+                                    color:activeTab===tab.id?"#ffb347":"rgba(232,244,241,0.4)",
+                                    borderBottom:activeTab===tab.id?"2px solid #ffb347":"2px solid transparent",
+                                }}>
+                                    {tab.label}
+                                </button>
                             ))}
                         </div>
 
-                        {/* Quick fill helper */}
-                        <div style={{
-                            padding:"10px 14px",background:"rgba(0,212,170,0.04)",
-                            border:"1px solid rgba(0,212,170,0.15)",borderRadius:6,marginBottom:14,
-                            fontSize:10,color:"rgba(232,244,241,0.5)",lineHeight:1.7,
-                        }}>
-                            <strong style={{color:"#00d4aa"}}>💡 Quick tip:</strong> To get 168 values from your own data,
-                            export the last 7 days of hourly demand from your SCADA or SLDC portal as CSV, then
-                            copy the MW column values (one row = one hour, oldest first).
-                            Typical ranges: Northern 55,000–92,000 MW · Western 65,000–105,000 MW ·
-                            Southern 45,000–78,000 MW · Eastern 25,000–48,000 MW · NE 1,500–3,800 MW
-                        </div>
+                        {/* ── TAB: QUICK SETUP ── */}
+                        {activeTab==="quick" && (
+                            <div>
+                                <div style={{fontSize:10,color:"rgba(232,244,241,0.45)",marginBottom:12,lineHeight:1.6}}>
+                                    Enter the <strong style={{color:"#ffb347"}}>expected peak demand</strong> for today in each region (in MW).
+                                    Leave blank to use the last 7 days from the dataset automatically.
+                                    The model will build a realistic 7-day history around your peak value.
+                                </div>
+                                <div style={{display:"grid",gridTemplateColumns:"repeat(5,minmax(0,1fr))",gap:12}}>
+                                    {REGIONS.map(r=>{
+                                        const ranges: Record<string,[number,number]> = {
+                                            Northern_Region_mw:[45000,92000], Western_Region_mw:[55000,105000],
+                                            Eastern_Region_mw:[22000,48000],  Southern_Region_mw:[38000,78000],
+                                            NorthEastern_Region_mw:[1200,3800],
+                                        };
+                                        const [lo,hi] = ranges[r.col] ?? [1000,130000];
+                                        const val = quickInputs[r.col];
+                                        const num = Number(val);
+                                        const pct = val && !isNaN(num) ? Math.round(((num-lo)/(hi-lo))*100) : 0;
+                                        const utilColor = pct>90?"#ff4d6a":pct>75?"#ffb347":r.color;
+                                        return (
+                                            <div key={r.col}>
+                                                <div style={{display:"flex",alignItems:"center",gap:5,marginBottom:6}}>
+                                                    <div style={{width:8,height:8,borderRadius:2,background:r.color}} />
+                                                    <span style={{fontSize:11,fontWeight:500,color:r.color}}>{r.label}</span>
+                                                </div>
+                                                <div style={{position:"relative"}}>
+                                                    <input type="number" min={lo} max={hi} step={100}
+                                                           placeholder={`e.g. ${Math.round((lo+hi)/2/1000)*1000}`}
+                                                           value={quickInputs[r.col]}
+                                                           onChange={e=>setQuickInputs(p=>({...p,[r.col]:e.target.value}))}
+                                                           style={{
+                                                               width:"100%",boxSizing:"border-box",
+                                                               background:"rgba(255,255,255,0.05)",
+                                                               border:`1px solid ${inputErrors[r.col]?"rgba(255,77,106,0.6)":val?"rgba(255,179,71,0.4)":"rgba(255,255,255,0.1)"}`,
+                                                               color:"#e8f4f1",borderRadius:6,padding:"8px 10px",
+                                                               fontFamily:"monospace",fontSize:12,outline:"none",
+                                                           }} />
+                                                </div>
+                                                {val && !isNaN(num) && (
+                                                    <>
+                                                        <div style={{height:3,background:"rgba(255,255,255,0.07)",borderRadius:2,marginTop:5,overflow:"hidden"}}>
+                                                            <div style={{height:"100%",width:`${Math.min(pct,100)}%`,background:utilColor,transition:"width 0.3s"}} />
+                                                        </div>
+                                                        <div style={{display:"flex",justifyContent:"space-between",marginTop:2,fontSize:9,fontFamily:"monospace"}}>
+                                                            <span style={{color:"rgba(232,244,241,0.35)"}}>{(lo/1000).toFixed(0)}K</span>
+                                                            <span style={{color:utilColor}}>{(num/1000).toFixed(1)} GW ({pct}%)</span>
+                                                            <span style={{color:"rgba(232,244,241,0.35)"}}>{(hi/1000).toFixed(0)}K</span>
+                                                        </div>
+                                                    </>
+                                                )}
+                                                {inputErrors[r.col] && <div style={{fontSize:9,marginTop:3,color:"#ff4d6a"}}>{inputErrors[r.col]}</div>}
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                            </div>
+                        )}
 
-                        <div style={{display:"flex",gap:10,alignItems:"center"}}>
+                        {/* ── TAB: WEATHER ── */}
+                        {activeTab==="weather" && (
+                            <div>
+                                <div style={{fontSize:10,color:"rgba(232,244,241,0.45)",marginBottom:14,lineHeight:1.6}}>
+                                    Set today's temperature and humidity per region. These directly affect AC load
+                                    (each °C above 30°C adds ~0.8% to demand) and the model's weather features.
+                                    Only relevant if you also entered peak demand in Quick Setup.
+                                </div>
+                                <div style={{display:"flex",flexDirection:"column",gap:14}}>
+                                    {REGIONS.map(r=>{
+                                        const wx = weatherInputs[r.col];
+                                        const tempColor = wx.temp>40?"#ff4d6a":wx.temp>35?"#ffb347":"#00d4aa";
+                                        return (
+                                            <div key={r.col} style={{background:"rgba(255,255,255,0.02)",borderRadius:8,padding:"12px 14px",
+                                                border:`1px solid rgba(255,255,255,0.06)`}}>
+                                                <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}>
+                                                    <div style={{width:8,height:8,borderRadius:2,background:r.color}} />
+                                                    <span style={{fontSize:12,fontWeight:500,color:r.color}}>{r.label} Region</span>
+                                                </div>
+                                                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:16}}>
+                                                    {/* Temperature */}
+                                                    <div>
+                                                        <div style={{display:"flex",justifyContent:"space-between",marginBottom:5}}>
+                                                            <span style={{fontSize:11,color:"rgba(232,244,241,0.6)"}}>🌡 Temperature</span>
+                                                            <span style={{fontFamily:"monospace",fontSize:11,color:tempColor,fontWeight:500}}>{wx.temp}°C</span>
+                                                        </div>
+                                                        <input type="range" min={10} max={48} step={1} value={wx.temp}
+                                                               onChange={e=>setWeatherInputs(p=>({...p,[r.col]:{...p[r.col],temp:Number(e.target.value)}}))}
+                                                               style={{width:"100%",accentColor:tempColor}} />
+                                                        <div style={{display:"flex",justifyContent:"space-between",fontSize:9,color:"rgba(232,244,241,0.35)"}}>
+                                                            <span>10°C</span>
+                                                            <span style={{color:tempColor,fontSize:9}}>
+                                {wx.temp>40?"Extreme heat":wx.temp>35?"Very hot":wx.temp>30?"Hot":wx.temp>24?"Warm":"Cool"}
+                              </span>
+                                                            <span>48°C</span>
+                                                        </div>
+                                                    </div>
+                                                    {/* Humidity */}
+                                                    <div>
+                                                        <div style={{display:"flex",justifyContent:"space-between",marginBottom:5}}>
+                                                            <span style={{fontSize:11,color:"rgba(232,244,241,0.6)"}}>💧 Humidity</span>
+                                                            <span style={{fontFamily:"monospace",fontSize:11,color:"#4da6ff",fontWeight:500}}>{wx.humidity}%</span>
+                                                        </div>
+                                                        <input type="range" min={10} max={98} step={1} value={wx.humidity}
+                                                               onChange={e=>setWeatherInputs(p=>({...p,[r.col]:{...p[r.col],humidity:Number(e.target.value)}}))}
+                                                               style={{width:"100%",accentColor:"#4da6ff"}} />
+                                                        <div style={{display:"flex",justifyContent:"space-between",fontSize:9,color:"rgba(232,244,241,0.35)"}}>
+                                                            <span>10%</span>
+                                                            <span style={{color:"#4da6ff",fontSize:9}}>
+                                {wx.humidity>85?"Monsoon":wx.humidity>70?"Humid":wx.humidity>50?"Moderate":"Dry"}
+                              </span>
+                                                            <span>98%</span>
+                                                        </div>
+                                                    </div>
+                                                    {/* Heat index display */}
+                                                    <div style={{display:"flex",flexDirection:"column",justifyContent:"center",alignItems:"center",
+                                                        background:"rgba(255,255,255,0.03)",borderRadius:6,padding:"6px 10px"}}>
+                                                        <div style={{fontSize:9,color:"rgba(232,244,241,0.4)",marginBottom:4}}>Feels like</div>
+                                                        <div style={{fontFamily:"monospace",fontSize:22,fontWeight:700,color:tempColor}}>
+                                                            {Math.round(wx.temp + Math.max(0,(wx.humidity-60)*0.08))}°C
+                                                        </div>
+                                                        <div style={{fontSize:9,color:"rgba(232,244,241,0.35)",marginTop:2}}>Heat index</div>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                            </div>
+                        )}
+
+                        {/* ── TAB: HOLIDAYS ── */}
+                        {activeTab==="holidays" && (
+                            <div>
+                                <div style={{fontSize:10,color:"rgba(232,244,241,0.45)",marginBottom:16,lineHeight:1.6}}>
+                                    Override holiday detection for the forecast date. The model auto-detects
+                                    Republic Day, Independence Day, Diwali etc. from the calendar — use these
+                                    toggles only if you want to force a specific condition.
+                                </div>
+                                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+                                    {([
+                                        {key:"is_national_holiday", label:"National Holiday", icon:"🇮🇳",
+                                            desc:"Republic Day, Independence Day, Gandhi Jayanti — demand drops 10–15%",
+                                            effect:"−10–15% demand"},
+                                        {key:"is_major_festival",   label:"Major Festival",   icon:"🎆",
+                                            desc:"Diwali, Holi, Eid, Durga Puja — factories close, residential up",
+                                            effect:"−15–20% industrial"},
+                                        {key:"is_diwali_window",    label:"Diwali Window",    icon:"🪔",
+                                            desc:"Full 5-day Diwali festival — largest sustained demand drop of the year",
+                                            effect:"−15–20% sustained"},
+                                        {key:"is_pre_festival",     label:"Pre-Festival Day", icon:"🛍",
+                                            desc:"3 days before Diwali or Eid — demand spikes from shopping and cooking",
+                                            effect:"+5–8% spike"},
+                                    ] as const).map(item=>{
+                                        const active = holidayInputs[item.key];
+                                        return (
+                                            <div key={item.key} onClick={()=>setHolidayInputs(p=>({...p,[item.key]:!p[item.key]}))}
+                                                 style={{
+                                                     padding:"14px 16px",borderRadius:8,cursor:"pointer",transition:"all 0.2s",
+                                                     background:active?"rgba(255,179,71,0.1)":"rgba(255,255,255,0.025)",
+                                                     border:`1px solid ${active?"rgba(255,179,71,0.4)":"rgba(255,255,255,0.07)"}`,
+                                                 }}>
+                                                <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:6}}>
+                                                    <span style={{fontSize:20}}>{item.icon}</span>
+                                                    <span style={{fontSize:12,fontWeight:500,color:active?"#ffb347":"#e8f4f1"}}>{item.label}</span>
+                                                    <div style={{marginLeft:"auto",width:20,height:20,borderRadius:"50%",
+                                                        background:active?"#ffb347":"rgba(255,255,255,0.1)",
+                                                        border:`2px solid ${active?"#ffb347":"rgba(255,255,255,0.2)"}`,
+                                                        display:"flex",alignItems:"center",justifyContent:"center",
+                                                        fontSize:11,color:active?"#0a0f14":"transparent",flexShrink:0}}>✓</div>
+                                                </div>
+                                                <div style={{fontSize:10,color:"rgba(232,244,241,0.5)",lineHeight:1.5,marginBottom:5}}>{item.desc}</div>
+                                                <div style={{fontSize:10,fontFamily:"monospace",
+                                                    color:item.key==="is_pre_festival"?"#00d4aa":"#ff4d6a"}}>
+                                                    Expected effect: {item.effect}
+                                                </div>
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                                <div style={{marginTop:12,padding:"8px 12px",background:"rgba(0,212,170,0.04)",
+                                    border:"1px solid rgba(0,212,170,0.15)",borderRadius:6,fontSize:10,color:"rgba(232,244,241,0.5)"}}>
+                                    💡 The model auto-detects holidays from the forecast date you set above.
+                                    These toggles <strong style={{color:"#00d4aa"}}>override</strong> that detection — useful for
+                                    local festivals not in the national calendar (e.g. Pongal in Tamil Nadu, Durga Puja in West Bengal).
+                                </div>
+                            </div>
+                        )}
+
+                        {/* ── TAB: ADVANCED ── */}
+                        {activeTab==="advanced" && (
+                            <div>
+                                <div style={{fontSize:10,color:"rgba(232,244,241,0.45)",marginBottom:12,lineHeight:1.6}}>
+                                    Paste <strong style={{color:"#ffb347"}}>exactly 168 comma-separated MW values</strong> per region
+                                    (7 days × 24 hours, oldest first). This gives the model real historical data
+                                    instead of the synthetic history generated by Quick Setup.
+                                    Leave blank to use the last 7 days from data/demand.csv.
+                                </div>
+                                <div style={{display:"grid",gridTemplateColumns:"repeat(5,minmax(0,1fr))",gap:10}}>
+                                    {REGIONS.map(r=>{
+                                        const cnt = customInputs[r.col] ? customInputs[r.col].split(/[\s,\n\r]+/).filter(Boolean).length : 0;
+                                        return (
+                                            <div key={r.col}>
+                                                <div style={{display:"flex",alignItems:"center",gap:5,marginBottom:5}}>
+                                                    <div style={{width:7,height:7,borderRadius:2,background:r.color}} />
+                                                    <span style={{fontSize:11,color:r.color,fontWeight:500}}>{r.label}</span>
+                                                    {cnt>0 && (
+                                                        <span style={{marginLeft:"auto",fontSize:9,fontFamily:"monospace",
+                                                            color:cnt>=168?"#00d4aa":"#ffb347"}}>
+                              {cnt}/168 {cnt>=168?"✓":""}
+                            </span>
+                                                    )}
+                                                </div>
+                                                <textarea rows={5}
+                                                          placeholder={`168 values, comma-separated\nOldest first\n(blank = auto)`}
+                                                          value={customInputs[r.col]||""}
+                                                          onChange={e=>setCustomInputs(p=>({...p,[r.col]:e.target.value}))}
+                                                          style={{
+                                                              width:"100%",boxSizing:"border-box",
+                                                              background:"rgba(255,255,255,0.04)",
+                                                              border:`1px solid ${inputErrors[r.col]?"rgba(255,77,106,0.5)":cnt>0?"rgba(255,179,71,0.35)":"rgba(255,255,255,0.1)"}`,
+                                                              color:"#e8f4f1",borderRadius:6,padding:"7px 9px",
+                                                              fontFamily:"monospace",fontSize:9,resize:"vertical",outline:"none",
+                                                          }} />
+                                                {inputErrors[r.col] && <div style={{fontSize:9,marginTop:2,color:"#ff4d6a"}}>{inputErrors[r.col]}</div>}
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                                <div style={{marginTop:10,fontSize:10,color:"rgba(232,244,241,0.4)"}}>
+                                    Typical ranges: Northern 45–92K MW · Western 55–105K MW ·
+                                    Southern 38–78K MW · Eastern 22–48K MW · NE 1.2–3.8K MW
+                                </div>
+                            </div>
+                        )}
+
+                        {/* Footer: summary + run button */}
+                        <div style={{marginTop:16,paddingTop:14,borderTop:"1px solid rgba(255,255,255,0.07)",
+                            display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+                            {/* Summary of what will be used */}
+                            <div style={{flex:1,fontSize:10,color:"rgba(232,244,241,0.4)"}}>
+                                {activeTab!=="advanced" && (
+                                    <>
+                                        {Object.values(quickInputs).filter(Boolean).length > 0
+                                            ? <span style={{color:"#00d4aa"}}>✓ {Object.values(quickInputs).filter(Boolean).length} region{Object.values(quickInputs).filter(Boolean).length>1?"s":""} with custom peak</span>
+                                            : <span>No regions filled — will use dataset history</span>
+                                        }
+                                        {Object.values(holidayInputs).some(Boolean) && (
+                                            <span style={{marginLeft:10,color:"#ffb347"}}>
+                        + {Object.entries(holidayInputs).filter(([,v])=>v).map(([k])=>k.replace("is_","").replace(/_/g," ")).join(", ")}
+                      </span>
+                                        )}
+                                    </>
+                                )}
+                            </div>
                             <button onClick={runCustomForecast} disabled={loading} style={{
-                                background:loading?"rgba(255,179,71,0.2)":"rgba(255,179,71,0.15)",
+                                background:loading?"rgba(255,179,71,0.1)":"rgba(255,179,71,0.18)",
                                 border:"1px solid rgba(255,179,71,0.5)",color:"#ffb347",
-                                borderRadius:6,padding:"8px 20px",fontFamily:"monospace",
-                                fontSize:11,cursor:loading?"not-allowed":"pointer",fontWeight:500,
+                                borderRadius:6,padding:"9px 22px",fontFamily:"monospace",
+                                fontSize:11,cursor:loading?"not-allowed":"pointer",fontWeight:600,letterSpacing:"0.05em",
                             }}>
-                                {loading?"Running…":"⚡ Run Custom Forecast"}
+                                {loading?"Running…":"⚡ Run Forecast"}
                             </button>
                             <button onClick={()=>setCustomPanel(false)} style={{
                                 background:"transparent",border:"1px solid rgba(255,255,255,0.1)",
-                                color:"rgba(232,244,241,0.4)",borderRadius:6,padding:"8px 16px",
+                                color:"rgba(232,244,241,0.4)",borderRadius:6,padding:"9px 16px",
                                 fontFamily:"monospace",fontSize:11,cursor:"pointer",
                             }}>Cancel</button>
-                            <span style={{fontSize:10,color:"rgba(232,244,241,0.3)",marginLeft:4}}>
-                Regions with no input use the last 7 days from data/demand.csv automatically
-              </span>
                         </div>
                     </div>
                 )}

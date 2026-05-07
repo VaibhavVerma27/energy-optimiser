@@ -10,6 +10,17 @@ export interface ForecastHour {
     historical_baseline_mw: number;
     adjusted_demand_mw: number;
     capacity_mw: number;
+    // Confidence interval (80% by default) — present when model has been retrained
+    ci_lower_mw?: number;
+    ci_upper_mw?: number;
+    ci_level?: number;
+    // Weather at forecast time (present when weather_fetcher.py has been run)
+    weather_temp_c?: number;
+    weather_humidity_pct?: number;
+    // Holiday flags
+    is_national_holiday?: number;
+    is_major_festival?: number;
+    is_diwali_window?: number;
 }
 
 export interface OverloadSummary {

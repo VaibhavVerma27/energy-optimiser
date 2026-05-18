@@ -1,588 +1,301 @@
 "use client";
 
 import { useEffect, useState, useCallback } from "react";
-import { fetchAllRegions, type AllRegionsForecast } from "../../lib/api";
-import {
-    ResponsiveContainer, ComposedChart, Area, Line, BarChart, Bar,
-    ReferenceLine, XAxis, YAxis, Tooltip, CartesianGrid, Cell,
-} from "recharts";
+import { fetchMeritDispatch } from "../../lib/api";
 
-// ── India constants ───────────────────────────────────────────────────────────
-const REGIONS = [
-    { col:"Northern_Region_mw",    id:"Northern_Region",    label:"Northern",  color:"#4da6ff", capacity:115000 },
-    { col:"Western_Region_mw",     id:"Western_Region",     label:"Western",   color:"#ffb347", capacity:130000 },
-    { col:"Southern_Region_mw",    id:"Southern_Region",    label:"Southern",  color:"#00d4aa", capacity:95000  },
-    { col:"Eastern_Region_mw",     id:"Eastern_Region",     label:"Eastern",   color:"#ff4d6a", capacity:55000  },
-    { col:"NorthEastern_Region_mw",id:"NorthEastern_Region",label:"NE Region", color:"#c084fc", capacity:4500   },
+const MERIT_ORDER = [
+    { id:"nuclear",  label:"Nuclear",       cost:1.50, co2:0.000, color:"#c084fc" },
+    { id:"hydro",    label:"Hydro",          cost:0.50, co2:0.000, color:"#00d4aa" },
+    { id:"solar",    label:"Solar",          cost:2.80, co2:0.000, color:"#ffd60a" },
+    { id:"wind",     label:"Wind",           cost:3.20, co2:0.000, color:"#4da6ff" },
+    { id:"other",    label:"Other RE",       cost:4.00, co2:0.050, color:"#888888" },
+    { id:"coal_old", label:"Coal (old PPA)", cost:4.20, co2:0.820, color:"#ff6b35" },
+    { id:"coal_new", label:"Coal (new PPA)", cost:6.00, co2:0.820, color:"#ff4d6a" },
+    { id:"gas",      label:"Gas",            cost:7.50, co2:0.450, color:"#ffb347" },
 ];
 
-// India cost/carbon constants
-const COST_EV_INR_PER_MWH    = 600;
-const COST_AGRI_INR_PER_MWH  = 400;
-const COST_IND_SAVE_INR_MWH  = 2200;
-const COST_BACKUP_INR_PER_MWH= 8500;
-const CO2_BACKUP_KG_MWH      = 490;
-const CO2_GRID_KG_MWH        = 820;
-
-// Segment shares (India)
-const SEGMENTS = { residential:0.26, industrial:0.45, agriculture:0.18, commercial:0.11, ev:0.04 };
-
-// ── Types ─────────────────────────────────────────────────────────────────────
-interface SimParams {
-    evDelayHours:         number;
-    evShiftPct:           number;
-    agriShiftPct:         number;
-    industrialCutPct:     number;
-    residentialFlexPct:   number;
-    backupSupplyMw:       number;
-}
-
-interface SimHour {
-    label:           string;
-    hour:            number;
-    original:        number;
-    dynamicCap:      number;   // per-hour capacity from forecast
-    ev_shifted:      number;
-    agri_shifted:    number;
-    industrial_cut:  number;
-    residential_flex:number;
-    backup_added:    number;
-    final:           number;
-    overCapacity:    boolean;
-    saving:          number;
-    solar_mw:        number;
-    wind_mw:         number;
-    hydro_mw:        number;
-    thermal_mw:      number;
-}
-
-// ── Simulation engine ─────────────────────────────────────────────────────────
-function runSimulation(
-    forecast: any[],
-    params: SimParams,
-): SimHour[] {
-    const n = forecast.length;
-    // Use per-hour dynamic capacity from forecast data
-    const demand   = forecast.map(f => f.predicted_demand_mw);
-    const caps     = forecast.map(f => f.capacity_mw ?? 95000);
-    const result: SimHour[] = [];
-
-    // Mutable demand array
-    const adj = [...demand];
-
-    const evShifted       = new Array(n).fill(0);
-    const agriShifted     = new Array(n).fill(0);
-    const indCut          = new Array(n).fill(0);
-    const resFlex         = new Array(n).fill(0);
-    const backupAdded     = new Array(n).fill(0);
-
-    // 1. EV delay
-    for (let i = 0; i < n; i++) {
-        const evLoad = demand[i] * SEGMENTS.ev * (params.evShiftPct / 100);
-        adj[i] -= evLoad;
-        evShifted[i] = evLoad;
-        const tgt = Math.min(i + params.evDelayHours, n - 1);
-        adj[tgt] += evLoad;
-    }
-
-    // 2. Agricultural pump shift
-    for (let i = 0; i < n; i++) {
-        if (adj[i] > caps[i]) {
-            const cut = demand[i] * SEGMENTS.agriculture * (params.agriShiftPct / 100);
-            adj[i] -= cut;
-            agriShifted[i] = cut;
-        }
-    }
-
-    // 3. Industrial curtailment
-    for (let i = 0; i < n; i++) {
-        if (adj[i] > caps[i]) {
-            const cut = demand[i] * SEGMENTS.industrial * (params.industrialCutPct / 100);
-            adj[i] -= cut;
-            indCut[i] = cut;
-        }
-    }
-
-    // 4. Residential flex
-    for (let i = 0; i < n; i++) {
-        if (adj[i] > caps[i]) {
-            const cut = demand[i] * SEGMENTS.residential * (params.residentialFlexPct / 100);
-            adj[i] -= cut;
-            resFlex[i] = cut;
-        }
-    }
-
-    // 5. Backup generation
-    for (let i = 0; i < n; i++) {
-        if (adj[i] > caps[i]) {
-            const add = Math.min(adj[i] - caps[i], params.backupSupplyMw);
-            adj[i] -= add;
-            backupAdded[i] = add;
-        }
-    }
-
-    for (let i = 0; i < n; i++) {
-        result.push({
-            label:            forecast[i].label,
-            hour:             i,
-            original:         Math.round(demand[i]),
-            dynamicCap:       Math.round(caps[i]),
-            ev_shifted:       Math.round(evShifted[i]),
-            agri_shifted:     Math.round(agriShifted[i]),
-            industrial_cut:   Math.round(indCut[i]),
-            residential_flex: Math.round(resFlex[i]),
-            backup_added:     Math.round(backupAdded[i]),
-            final:            Math.round(adj[i]),
-            overCapacity:     adj[i] > caps[i],
-            saving:           Math.round(demand[i] - adj[i]),
-            solar_mw:         forecast[i].solar_available_mw ?? 0,
-            wind_mw:          forecast[i].wind_available_mw  ?? 0,
-            hydro_mw:         forecast[i].hydro_available_mw ?? 0,
-            thermal_mw:       forecast[i].thermal_available_mw ?? 0,
-        });
-    }
-    return result;
-}
-
-function calcCosts(hours: SimHour[]) {
-    const totalEvMwh    = hours.reduce((s,h)=>s+h.ev_shifted,0)    / 1000;
-    const totalAgriMwh  = hours.reduce((s,h)=>s+h.agri_shifted,0)  / 1000;
-    const totalIndMwh   = hours.reduce((s,h)=>s+h.industrial_cut,0)/ 1000;
-    const totalBackupMwh= hours.reduce((s,h)=>s+h.backup_added,0)  / 1000;
-    const backupCost    = Math.round(totalBackupMwh * COST_BACKUP_INR_PER_MWH);
-    const evCost        = Math.round(totalEvMwh    * COST_EV_INR_PER_MWH);
-    const agriCost      = Math.round(totalAgriMwh  * COST_AGRI_INR_PER_MWH);
-    const indSaving     = Math.round(totalIndMwh   * COST_IND_SAVE_INR_MWH);
-    const netCost       = backupCost + evCost + agriCost - indSaving;
-    const co2Backup     = Math.round(totalBackupMwh * CO2_BACKUP_KG_MWH);
-    const co2Avoided    = Math.round(hours.reduce((s,h)=>s+h.saving,0)/1000 * CO2_GRID_KG_MWH);
-    return { backupCost, evCost, agriCost, indSaving, netCost, co2Backup, co2Avoided, netCo2: co2Backup - co2Avoided };
-}
-
-// ── Sub-components ────────────────────────────────────────────────────────────
-const Tip = ({active,payload,label}:any) => {
-    if (!active||!payload?.length) return null;
+function MiniBar({value, max, color}:{value:number;max:number;color:string}) {
+    const pct = max > 0 ? Math.min(value/max*100,100) : 0;
     return (
-        <div style={{background:"#0d1821",border:"1px solid rgba(0,212,170,0.25)",borderRadius:6,padding:"10px 14px",fontSize:11}}>
-            <p style={{color:"#00d4aa",marginBottom:6,fontFamily:"monospace"}}>{label}</p>
-            {payload.map((p:any)=>(
-                <p key={p.name} style={{color:p.color??p.fill??"#e8f4f1",margin:"2px 0"}}>
-                    {p.name}: <strong>{typeof p.value==="number"?`${p.value.toLocaleString()} MW`:p.value}</strong>
-                </p>
-            ))}
-        </div>
-    );
-};
-
-function Slider({label,value,min,max,step=1,unit="%",color="#00d4aa",onChange,description}:{
-    label:string;value:number;min:number;max:number;
-    step?:number;unit?:string;color?:string;
-    onChange:(v:number)=>void;description:string;
-}) {
-    return (
-        <div style={{marginBottom:16}}>
-            <div style={{display:"flex",justifyContent:"space-between",marginBottom:5}}>
-                <span style={{fontSize:12,color:"#e8f4f1",fontWeight:500}}>{label}</span>
-                <span style={{fontFamily:"monospace",fontSize:12,color}}>{value}{unit}</span>
-            </div>
-            <input type="range" min={min} max={max} step={step} value={value}
-                   onChange={e=>onChange(Number(e.target.value))}
-                   style={{width:"100%",accentColor:color}} />
-            <div style={{display:"flex",justifyContent:"space-between",marginTop:2}}>
-                <span style={{fontSize:9,color:"rgba(232,244,241,0.35)"}}>{min}{unit}</span>
-                <span style={{fontSize:9,color:"rgba(232,244,241,0.35)"}}>{description}</span>
-                <span style={{fontSize:9,color:"rgba(232,244,241,0.35)"}}>{max}{unit}</span>
-            </div>
+        <div style={{height:5,background:"rgba(255,255,255,0.06)",borderRadius:3,overflow:"hidden"}}>
+            <div style={{height:"100%",width:`${pct}%`,background:color,borderRadius:3}}/>
         </div>
     );
 }
 
-function KPICard({label,value,color,sub}:{label:string;value:string|number;color:string;sub?:string}) {
-    return (
-        <div style={{background:"rgba(255,255,255,0.03)",border:"1px solid rgba(255,255,255,0.07)",borderRadius:8,padding:"11px 13px",borderTop:`2px solid ${color}`}}>
-            <div style={{fontSize:9,color:"rgba(232,244,241,0.45)",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:5}}>{label}</div>
-            <div style={{fontFamily:"monospace",fontSize:18,color}}>{typeof value==="number"?value.toLocaleString():value}</div>
-            {sub&&<div style={{fontSize:9,color:"rgba(232,244,241,0.35)",marginTop:2}}>{sub}</div>}
-        </div>
-    );
-}
-
-function NavLink({href,label,active}:{href:string;label:string;active?:boolean}) {
-    return (
-        <a href={href} style={{
-            fontFamily:"monospace",fontSize:10,letterSpacing:"0.08em",
-            textDecoration:"none",padding:"4px 12px",borderRadius:5,
-            background:active?"rgba(0,212,170,0.12)":"transparent",
-            color:active?"#00d4aa":"rgba(232,244,241,0.4)",
-            border:active?"1px solid rgba(0,212,170,0.25)":"1px solid transparent",
-        }}>{label}</a>
-    );
-}
-
-// ── Main page ─────────────────────────────────────────────────────────────────
 export default function SimulationPage() {
-    const [allForecast, setAllForecast] = useState<AllRegionsForecast|null>(null);
-    const [loading, setLoading]         = useState(true);
-    const [error, setError]             = useState<string|null>(null);
-    const [selectedRegion, setRegion]   = useState("Northern_Region_mw");
-    const [params, setParams]           = useState<SimParams>({
-        evDelayHours:2, evShiftPct:100, agriShiftPct:10,
-        industrialCutPct:15, residentialFlexPct:5, backupSupplyMw:2000,
-    });
+    const [data, setData]       = useState<any>(null);
+    const [loading, setLoading] = useState(true);
+    const [date, setDate]       = useState(new Date().toISOString().split("T")[0]);
+    const [activeHour, setActive] = useState<number|null>(null);
+    const [tab, setTab]         = useState<"cost"|"carbon"|"mix">("cost");
 
-    useEffect(()=>{
-        fetchAllRegions()
-            .then(setAllForecast)
-            .catch(e=>setError(e.message))
-            .finally(()=>setLoading(false));
-    },[]);
+    const load = useCallback(async () => {
+        setLoading(true);
+        try { const d = await fetchMeritDispatch(date); setData(d); }
+        catch(e) { console.error(e); }
+        setLoading(false);
+    }, [date]);
 
-    const set = (k:keyof SimParams) => (v:number) => setParams(p=>({...p,[k]:v}));
+    useEffect(() => { load(); }, [load]);
 
-    const dotStyle = (c:string):React.CSSProperties=>({width:6,height:6,borderRadius:"50%",background:c,display:"inline-block"});
-    const badgeStyle = (ok:boolean):React.CSSProperties=>({
-        fontFamily:"monospace",fontSize:10,padding:"3px 10px",borderRadius:20,
-        textTransform:"uppercase",letterSpacing:"0.08em",
-        background:ok?"rgba(0,212,170,0.12)":"rgba(255,77,106,0.12)",
-        color:ok?"#00d4aa":"#ff4d6a",
-        border:`1px solid ${ok?"rgba(0,212,170,0.3)":"rgba(255,77,106,0.3)"}`,
-    });
+    const ins   = data?.insights;
+    const hours: any[] = data?.hours ?? [];
+    const maxCost = Math.max(...hours.map((h:any) => h.avg_cost_rs_kwh), 0.01);
+    const maxCo2  = Math.max(...hours.map((h:any) => h.co2_g_kwh), 0.01);
+    const active  = activeHour != null ? hours.find((h:any) => h.hour === activeHour) : null;
 
-    const S: Record<string,React.CSSProperties> = {
-        root:{minHeight:"100vh",background:"#0a0f14",color:"#e8f4f1",fontFamily:"'Exo 2','Segoe UI',sans-serif",padding:"20px 24px"},
-        header:{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:20,paddingBottom:14,borderBottom:"1px solid rgba(255,255,255,0.08)"},
-        title:{fontFamily:"monospace",fontSize:13,letterSpacing:"0.15em",color:"#00d4aa",textTransform:"uppercase"},
-        panel:{background:"rgba(255,255,255,0.025)",border:"1px solid rgba(255,255,255,0.07)",borderRadius:8,padding:16},
-        kpiRow:{display:"grid",gridTemplateColumns:"repeat(4,minmax(0,1fr))",gap:10,marginBottom:12},
-        grid:{display:"grid",gridTemplateColumns:"280px 1fr",gap:14},
-        divider:{height:1,background:"rgba(255,255,255,0.07)",margin:"12px 0"},
-        select:{background:"rgba(255,255,255,0.05)",border:"1px solid rgba(255,255,255,0.1)",color:"#e8f4f1",borderRadius:6,padding:"4px 10px",fontSize:11,fontFamily:"monospace"},
+    const S: any = {
+        root:  {minHeight:"100vh",background:"#0a0f14",color:"#e8f4f1",fontFamily:"'Exo 2','Segoe UI',sans-serif",padding:"12px 24px"},
+        panel: {background:"rgba(255,255,255,0.025)",border:"1px solid rgba(255,255,255,0.07)",borderRadius:8,padding:16},
+        lbl:   {fontSize:10,letterSpacing:"0.12em",color:"rgba(232,244,241,0.4)",textTransform:"uppercase" as const,marginBottom:10},
+        tabBtn: (a:boolean) => ({padding:"5px 14px",borderRadius:5,fontSize:11,fontFamily:"monospace",cursor:"pointer",border:"none",background:a?"rgba(0,212,170,0.15)":"transparent",color:a?"#00d4aa":"rgba(232,244,241,0.4)",borderBottom:a?"2px solid #00d4aa":"2px solid transparent"}),
     };
-
-    if (loading) return (
-        <div style={{...S.root,display:"flex",alignItems:"center",justifyContent:"center"}}>
-            <div style={{fontFamily:"monospace",color:"#00d4aa",fontSize:13}}>LOADING FORECAST DATA...</div>
-        </div>
-    );
-
-    if (error||!allForecast) return (
-        <div style={{...S.root,display:"flex",alignItems:"center",justifyContent:"center"}}>
-            <div style={{color:"#ff4d6a",fontFamily:"monospace",textAlign:"center"}}>
-                {error||"No forecast data"}<br/>
-                <span style={{fontSize:10,color:"rgba(232,244,241,0.4)"}}>Is the backend running? cd app && uvicorn main:app --reload</span>
-            </div>
-        </div>
-    );
-
-    const regionForecast  = allForecast.regions[selectedRegion];
-    const regionInfo      = REGIONS.find(r=>r.col===selectedRegion)!;
-    const forecast        = regionForecast?.forecast ?? [];
-    const simHours        = forecast.length > 0 ? runSimulation(forecast, params) : [];
-    const costs           = calcCosts(simHours);
-
-    const peakOriginal    = Math.max(...simHours.map(h=>h.original), 0);
-    const peakFinal       = Math.max(...simHours.map(h=>h.final), 0);
-    const peakCap         = simHours.find(h=>h.original===peakOriginal)?.dynamicCap ?? 0;
-    const overloadHours   = simHours.filter(h=>h.overCapacity).length;
-    const totalEv         = simHours.reduce((s,h)=>s+h.ev_shifted,0);
-    const totalAgri       = simHours.reduce((s,h)=>s+h.agri_shifted,0);
-    const totalInd        = simHours.reduce((s,h)=>s+h.industrial_cut,0);
-    const totalBackup     = simHours.reduce((s,h)=>s+h.backup_added,0);
-
-    const chartData = simHours.map(h=>({
-        label:             h.label,
-        "Original":        h.original,
-        "Adjusted":        h.final,
-        "Dynamic Capacity":h.dynamicCap,
-        "Solar":           h.solar_mw,
-        "Wind":            h.wind_mw,
-        "Hydro":           h.hydro_mw,
-    }));
-
-    const savingsData = simHours.map(h=>({
-        label:         h.label,
-        "EV Delay":    h.ev_shifted,
-        "Agri Shift":  h.agri_shifted,
-        "Ind. Cut":    h.industrial_cut,
-        "Res. Flex":   h.residential_flex,
-        "Backup":      h.backup_added,
-    }));
-
-    const costBreakdown = [
-        {name:"Backup Gen",    value:costs.backupCost,  fill:"#ff4d6a"},
-        {name:"EV Incentive",  value:costs.evCost,      fill:"#4da6ff"},
-        {name:"Agri Incentive",value:costs.agriCost,    fill:"#c084fc"},
-        {name:"Ind. Savings",  value:-costs.indSaving,  fill:"#00d4aa"},
-    ];
 
     return (
         <div style={S.root}>
-            {/* Header */}
-            <div style={S.header}>
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:20,paddingTop:4}}>
                 <div>
-                    <div style={S.title}>⚡ Demand Response Simulator — India POSOCO</div>
-                    <div style={{fontSize:11,color:"rgba(232,244,241,0.4)",marginTop:3,fontFamily:"monospace"}}>
-                        Adjust sliders · real-time impact on demand curve · dynamic capacity · cost · carbon
+                    <div style={{fontFamily:"monospace",fontSize:13,letterSpacing:"0.15em",color:"#00d4aa",textTransform:"uppercase"}}>
+                        ⚡ Merit Order — Cost & Carbon Intensity
+                    </div>
+                    <div style={{fontSize:11,color:"rgba(232,244,241,0.4)",marginTop:2}}>
+                        Hour-by-hour dispatch cost · carbon intensity · renewable curtailment · All India
                     </div>
                 </div>
                 <div style={{display:"flex",alignItems:"center",gap:8}}>
-                    <NavLink href="/" label="Dashboard" />
-                    <NavLink href="/capacity" label="Capacity" />
-                    <NavLink href="/simulation" label="Simulator" active />
-                    <NavLink href="/insights" label="ML Insights" />
-                    <NavLink href="/history" label="History" />
-                    <span style={badgeStyle(overloadHours===0)}>
-            {overloadHours===0?"✓ Grid Stable":`⚠ ${overloadHours}h Overloaded`}
-          </span>
+
+
+
+
+                    <input type="date" value={date} onChange={e=>setDate(e.target.value)}
+                           style={{background:"rgba(255,255,255,0.05)",border:"1px solid rgba(255,255,255,0.1)",color:"#e8f4f1",borderRadius:6,padding:"4px 10px",fontSize:11,fontFamily:"monospace"}}/>
+                    <button onClick={load} style={{background:"transparent",border:"1px solid rgba(0,212,170,0.3)",color:"#00d4aa",borderRadius:6,padding:"4px 12px",fontFamily:"monospace",fontSize:10,cursor:"pointer"}}>
+                        {loading?"Loading…":"↻"}
+                    </button>
                 </div>
             </div>
 
-            {/* Region selector */}
-            <div style={{display:"flex",gap:10,marginBottom:14,alignItems:"center",flexWrap:"wrap"}}>
-                <span style={{fontSize:11,color:"rgba(232,244,241,0.5)"}}>Region:</span>
-                {REGIONS.map(r=>(
-                    <button key={r.col} onClick={()=>setRegion(r.col)} style={{
-                        background:selectedRegion===r.col?`${r.color}18`:"transparent",
-                        border:`1px solid ${selectedRegion===r.col?r.color+"60":"rgba(255,255,255,0.1)"}`,
-                        color:selectedRegion===r.col?r.color:"rgba(232,244,241,0.5)",
-                        borderRadius:6,padding:"4px 12px",fontFamily:"monospace",fontSize:10,cursor:"pointer",
-                    }}>{r.label}</button>
-                ))}
-                <span style={{marginLeft:"auto",fontSize:10,color:"rgba(232,244,241,0.4)",fontFamily:"monospace"}}>
-          Installed: {(regionInfo.capacity/1000).toFixed(0)} GW · Peak dynamic cap: {(peakCap/1000).toFixed(1)} GW
-        </span>
-            </div>
+            {loading && <div style={{textAlign:"center",padding:60,color:"rgba(232,244,241,0.3)",fontFamily:"monospace"}}>Computing merit dispatch…</div>}
 
-            {/* Summary KPIs */}
-            <div style={S.kpiRow}>
-                <KPICard label="Peak Original"  value={`${(peakOriginal/1000).toFixed(1)} GW`} color="#ff4d6a" sub="Before interventions" />
-                <KPICard label="Peak Adjusted"  value={`${(peakFinal/1000).toFixed(1)} GW`}   color={peakFinal<=peakCap?"#00d4aa":"#ffb347"} sub="After interventions" />
-                <KPICard label="Net Cost (₹)"   value={`${costs.netCost<0?"−":""}₹${Math.abs(costs.netCost).toLocaleString()}`} color={costs.netCost<0?"#00d4aa":"#ffb347"} sub={costs.netCost<0?"Net savings":"Net expense"} />
-                <KPICard label="Net CO₂ (t)"    value={`${costs.netCo2<0?"−":"+"}${Math.abs(Math.round(costs.netCo2/1000))}t`} color={costs.netCo2<0?"#00d4aa":"#ff4d6a"} sub={costs.netCo2<0?"Emissions avoided":"Extra emissions"} />
-            </div>
-
-            <div style={S.kpiRow}>
-                <KPICard label="EV Load Shifted"   value={totalEv.toLocaleString()} color="#00d4aa" sub={`+${params.evDelayHours}h delay`} />
-                <KPICard label="Agri Pump Deferred" value={totalAgri.toLocaleString()} color="#c084fc" sub={`${params.agriShiftPct}% shifted`} />
-                <KPICard label="Industrial Cut"    value={totalInd.toLocaleString()} color="#ffb347" sub={`${params.industrialCutPct}% curtailed`} />
-                <KPICard label="Overload Hours"    value={overloadHours} color={overloadHours===0?"#00d4aa":"#ff4d6a"} sub={overloadHours===0?"All safe":"Still at risk"} />
-            </div>
-
-            {/* Main layout */}
-            <div style={S.grid}>
-                {/* Controls */}
-                <div style={{display:"flex",flexDirection:"column",gap:12}}>
-                    <div style={S.panel}>
-                        <div style={{fontSize:10,color:"rgba(232,244,241,0.45)",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:12,display:"flex",alignItems:"center",gap:6}}>
-                            <span style={dotStyle("#4da6ff")} /> EV Charging
+            {!loading && ins && <>
+                {/* KPI cards */}
+                <div style={{display:"grid",gridTemplateColumns:"repeat(6,minmax(0,1fr))",gap:10,marginBottom:14}}>
+                    {[
+                        {l:"Avg Cost",       v:`₹${ins.avg_cost_rs_kwh?.toFixed(2)}/kWh`,                          s:"Weighted generation cost",                   c:"#ffd60a"},
+                        {l:"Cost Range",     v:`₹${ins.cheapest_cost?.toFixed(2)} – ₹${ins.expensive_cost?.toFixed(2)}`, s:`${ins.cost_ratio}× spread today`,       c:"#ffb347"},
+                        {l:"Avg CO₂",        v:`${(ins.avg_co2_kg_kwh*1000)?.toFixed(0)} g/kWh`,                  s:"Weighted carbon intensity",                   c:"#4da6ff"},
+                        {l:"CO₂ Range",      v:`${(ins.cleanest_co2*1000)?.toFixed(0)}–${(ins.dirtiest_co2*1000)?.toFixed(0)} g/kWh`, s:`${ins.cleanest_hour}:00 cleanest`,  c:"#00d4aa"},
+                        {l:"Avg Renewable",  v:`${ins.avg_renewable_pct?.toFixed(0)}%`,                            s:"Of generation today",                         c:"#00d4aa"},
+                        {l:"Curtailment",    v:`${ins.total_curtailed_gwh?.toFixed(1)} GWh`,                       s:"Renewable wasted today",                      c:"#ff4d6a"},
+                    ].map(m=>(
+                        <div key={m.l} style={{...S.panel,borderTop:`2px solid ${m.c}`,padding:"11px 13px"}}>
+                            <div style={{fontFamily:"monospace",fontSize:16,fontWeight:700,color:m.c,marginBottom:3}}>{m.v}</div>
+                            <div style={{fontSize:9,color:"rgba(232,244,241,0.4)",letterSpacing:"0.08em",textTransform:"uppercase"}}>{m.l}</div>
+                            <div style={{fontSize:9,color:"rgba(232,244,241,0.3)",marginTop:2}}>{m.s}</div>
                         </div>
-                        <Slider label="Shift Delay" value={params.evDelayHours} min={1} max={6} unit="h" color="#4da6ff" onChange={set("evDelayHours")} description="hours to delay" />
-                        <Slider label="Participation" value={params.evShiftPct} min={0} max={100} unit="%" color="#4da6ff" onChange={set("evShiftPct")} description="% EVs shifted" />
-                    </div>
-
-                    <div style={S.panel}>
-                        <div style={{fontSize:10,color:"rgba(232,244,241,0.45)",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:12,display:"flex",alignItems:"center",gap:6}}>
-                            <span style={dotStyle("#c084fc")} /> Agricultural Load
-                        </div>
-                        <Slider label="Pump Deferral" value={params.agriShiftPct} min={0} max={30} unit="%" color="#c084fc" onChange={set("agriShiftPct")} description="% irrigation pumps" />
-                    </div>
-
-                    <div style={S.panel}>
-                        <div style={{fontSize:10,color:"rgba(232,244,241,0.45)",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:12,display:"flex",alignItems:"center",gap:6}}>
-                            <span style={dotStyle("#ffb347")} /> Industrial Load
-                        </div>
-                        <Slider label="Curtailment" value={params.industrialCutPct} min={0} max={40} unit="%" color="#ffb347" onChange={set("industrialCutPct")} description="% reduction (DSM)" />
-                    </div>
-
-                    <div style={S.panel}>
-                        <div style={{fontSize:10,color:"rgba(232,244,241,0.45)",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:12,display:"flex",alignItems:"center",gap:6}}>
-                            <span style={dotStyle("#00d4aa")} /> Residential Flex
-                        </div>
-                        <Slider label="Opt-in Rate" value={params.residentialFlexPct} min={0} max={20} unit="%" color="#00d4aa" onChange={set("residentialFlexPct")} description="% households" />
-                    </div>
-
-                    <div style={S.panel}>
-                        <div style={{fontSize:10,color:"rgba(232,244,241,0.45)",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:12,display:"flex",alignItems:"center",gap:6}}>
-                            <span style={dotStyle("#ff4d6a")} /> Backup Generation
-                        </div>
-                        <Slider label="Available" value={params.backupSupplyMw} min={0} max={5000} step={100} unit=" MW" color="#ff4d6a" onChange={set("backupSupplyMw")} description="peaker + DG sets" />
-                    </div>
-
-                    {/* Cost panel */}
-                    <div style={S.panel}>
-                        <div style={{fontSize:10,color:"rgba(232,244,241,0.45)",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:10}}>Cost Breakdown (₹)</div>
-                        {[
-                            {label:"Backup gen cost",    value:costs.backupCost,  color:"#ff4d6a", positive:true},
-                            {label:"EV incentive",       value:costs.evCost,      color:"#4da6ff", positive:true},
-                            {label:"Agri incentive",     value:costs.agriCost,    color:"#c084fc", positive:true},
-                            {label:"Industrial savings", value:-costs.indSaving,  color:"#00d4aa", positive:false},
-                        ].map(row=>(
-                            <div key={row.label} style={{display:"flex",justifyContent:"space-between",padding:"5px 0",borderBottom:"1px solid rgba(255,255,255,0.05)",fontSize:11}}>
-                                <span style={{color:"rgba(232,244,241,0.55)"}}>{row.label}</span>
-                                <span style={{fontFamily:"monospace",color:row.color}}>
-                  {row.positive?"+":""}{row.value<0?"−":""}₹{Math.abs(row.value).toLocaleString()}
-                </span>
-                            </div>
-                        ))}
-                        <div style={{display:"flex",justifyContent:"space-between",paddingTop:8,marginTop:4}}>
-                            <span style={{fontSize:12,fontWeight:500,color:"#e8f4f1"}}>Net</span>
-                            <span style={{fontFamily:"monospace",fontSize:14,color:costs.netCost<0?"#00d4aa":"#ffb347",fontWeight:500}}>
-                {costs.netCost<0?"−":"+"}₹{Math.abs(costs.netCost).toLocaleString()}
-              </span>
-                        </div>
-                        <ResponsiveContainer width="100%" height={70}>
-                            <BarChart data={costBreakdown} margin={{top:8,right:0,left:-24,bottom:0}}>
-                                <XAxis dataKey="name" tick={{fill:"rgba(232,244,241,0.35)",fontSize:8}} axisLine={false} tickLine={false} />
-                                <YAxis hide />
-                                <Tooltip formatter={(v:any)=>[`₹${Math.abs(v).toLocaleString()}`,""]} contentStyle={{background:"#0d1821",border:"1px solid rgba(0,212,170,0.2)",fontSize:10}} />
-                                <Bar dataKey="value" radius={[3,3,0,0]}>
-                                    {costBreakdown.map((e,i)=><Cell key={i} fill={e.fill} fillOpacity={0.8} />)}
-                                </Bar>
-                            </BarChart>
-                        </ResponsiveContainer>
-                    </div>
-
-                    {/* Carbon panel */}
-                    <div style={S.panel}>
-                        <div style={{fontSize:10,color:"rgba(232,244,241,0.45)",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:10}}>Carbon Impact</div>
-                        {[
-                            {label:"CO₂ from backup",   value:Math.round(costs.co2Backup/1000), unit:"t",  color:"#ff4d6a", barPct:Math.min((costs.co2Backup/5000)*100,100)},
-                            {label:"CO₂ avoided",       value:Math.round(costs.co2Avoided/1000),unit:"t",  color:"#00d4aa", barPct:Math.min((costs.co2Avoided/5000)*100,100)},
-                        ].map(row=>(
-                            <div key={row.label} style={{marginBottom:8}}>
-                                <div style={{display:"flex",justifyContent:"space-between",fontSize:10,marginBottom:3}}>
-                                    <span style={{color:"rgba(232,244,241,0.5)"}}>{row.label}</span>
-                                    <span style={{fontFamily:"monospace",color:row.color}}>{row.value} {row.unit}</span>
-                                </div>
-                                <div style={{height:5,background:"rgba(255,255,255,0.07)",borderRadius:3,overflow:"hidden"}}>
-                                    <div style={{height:"100%",width:`${row.barPct}%`,background:row.color,borderRadius:3,transition:"width 0.4s"}} />
-                                </div>
-                            </div>
-                        ))}
-                        <div style={{display:"flex",justifyContent:"space-between",paddingTop:8,borderTop:"1px solid rgba(255,255,255,0.07)",marginTop:4}}>
-                            <span style={{fontSize:11,color:"#e8f4f1"}}>Net CO₂</span>
-                            <span style={{fontFamily:"monospace",fontSize:13,color:costs.netCo2<0?"#00d4aa":"#ff4d6a"}}>
-                {costs.netCo2<0?"−":"+"}  {Math.abs(Math.round(costs.netCo2/1000))} t
-              </span>
-                        </div>
-                    </div>
+                    ))}
                 </div>
 
-                {/* Charts */}
-                <div style={{display:"flex",flexDirection:"column",gap:12}}>
-
-                    {/* Main demand vs dynamic capacity chart */}
-                    <div style={S.panel}>
-                        <div style={{fontSize:10,color:"rgba(232,244,241,0.45)",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:10,display:"flex",alignItems:"center",gap:6}}>
-                            <span style={dotStyle(regionInfo.color)} /> 24h Demand vs Dynamic Capacity — {regionInfo.label}
+                {/* Shift opportunity banner */}
+                {ins.shift_saving_crore > 0 && (
+                    <div style={{...S.panel,marginBottom:14,background:"rgba(0,212,170,0.04)",borderColor:"rgba(0,212,170,0.2)",display:"flex",alignItems:"center",gap:16}}>
+                        <div style={{fontSize:22}}>💡</div>
+                        <div style={{flex:1}}>
+                            <div style={{fontSize:12,fontWeight:600,color:"#00d4aa",marginBottom:3}}>Load Shift Opportunity</div>
+                            <div style={{fontSize:11,color:"rgba(232,244,241,0.6)"}}>
+                                Shifting 5 GW flexible load from{" "}
+                                <strong style={{color:"#ff4d6a"}}>{ins.worst_hours?.map((h:number)=>`${h}:00`).join(", ")}</strong> to{" "}
+                                <strong style={{color:"#00d4aa"}}>{ins.best_hours?.map((h:number)=>`${h}:00`).join(", ")}</strong> saves{" "}
+                                <strong style={{color:"#ffd60a"}}>₹{ins.shift_saving_crore} crore</strong> and reduces{" "}
+                                <strong style={{color:"#4da6ff"}}>{ins.shift_co2_saving_t?.toLocaleString()} t CO₂</strong> today.
+                            </div>
                         </div>
-                        <div style={{display:"flex",gap:14,marginBottom:10,flexWrap:"wrap"}}>
-                            {[
-                                {color:"#ff4d6a",    label:"Original demand"},
-                                {color:"#00d4aa",    label:"Adjusted demand"},
-                                {color:"#a78bfa",    label:"Dynamic capacity (varies hourly)"},
-                            ].map(l=>(
-                                <div key={l.label} style={{display:"flex",alignItems:"center",gap:5,fontSize:10,color:"rgba(232,244,241,0.5)"}}>
-                                    <div style={{width:14,height:2,background:l.color}} />{l.label}
-                                </div>
-                            ))}
-                        </div>
-                        <ResponsiveContainer width="100%" height={230}>
-                            <ComposedChart data={chartData} margin={{top:4,right:12,left:0,bottom:0}}>
-                                <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" vertical={false} />
-                                <XAxis dataKey="label" tick={{fill:"rgba(232,244,241,0.35)",fontSize:9,fontFamily:"monospace"}} axisLine={{stroke:"rgba(255,255,255,0.08)"}} tickLine={false} interval={3} />
-                                <YAxis tickFormatter={(v:number)=>`${(v/1000).toFixed(0)}K`} tick={{fill:"rgba(232,244,241,0.35)",fontSize:9,fontFamily:"monospace"}} axisLine={false} tickLine={false} width={38} />
-                                <Tooltip content={<Tip />} />
-                                <Area  type="monotone" dataKey="Original"         stroke="#ff4d6a" fill="rgba(255,77,106,0.07)" strokeWidth={2} dot={false} />
-                                <Line  type="monotone" dataKey="Adjusted"         stroke="#00d4aa" strokeWidth={2.5} dot={false} />
-                                <Line  type="monotone" dataKey="Dynamic Capacity" stroke="#a78bfa" strokeWidth={2} strokeDasharray="6 3" dot={false} />
-                            </ComposedChart>
-                        </ResponsiveContainer>
-                        <div style={{fontSize:10,color:"rgba(232,244,241,0.35)",marginTop:6}}>
-                            Dynamic capacity line reflects real solar availability (drops at night), wind (peaks in monsoon), hydro (peaks post-monsoon), and thermal PLF.
+                        <div style={{textAlign:"center",padding:"8px 16px",background:"rgba(255,215,10,0.08)",borderRadius:6,border:"1px solid rgba(255,215,10,0.2)"}}>
+                            <div style={{fontFamily:"monospace",fontSize:20,fontWeight:700,color:"#ffd60a"}}>₹{ins.shift_saving_crore}Cr</div>
+                            <div style={{fontSize:9,color:"rgba(232,244,241,0.4)"}}>potential saving</div>
                         </div>
                     </div>
+                )}
 
-                    {/* Renewable availability chart */}
+                {/* Chart + detail */}
+                <div style={{display:"grid",gridTemplateColumns:"1fr 280px",gap:14,marginBottom:14}}>
                     <div style={S.panel}>
-                        <div style={{fontSize:10,color:"rgba(232,244,241,0.45)",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:10,display:"flex",alignItems:"center",gap:6}}>
-                            <span style={dotStyle("#ffd60a")} /> Renewable Generation Availability — Hourly
+                        <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:12}}>
+                            <div style={S.lbl}>24-Hour Profile</div>
+                            <div style={{display:"flex",gap:4,marginLeft:"auto"}}>
+                                {(["cost","carbon","mix"] as const).map(t=>(
+                                    <button key={t} onClick={()=>setTab(t)} style={S.tabBtn(tab===t)}>
+                                        {t==="cost"?"₹ Cost":t==="carbon"?"CO₂":t==="mix"?"⚡ Mix":""}
+                                    </button>
+                                ))}
+                            </div>
                         </div>
-                        <ResponsiveContainer width="100%" height={160}>
-                            <ComposedChart data={chartData} margin={{top:4,right:12,left:0,bottom:0}}>
-                                <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" vertical={false} />
-                                <XAxis dataKey="label" tick={{fill:"rgba(232,244,241,0.35)",fontSize:9,fontFamily:"monospace"}} axisLine={false} tickLine={false} interval={3} />
-                                <YAxis tick={{fill:"rgba(232,244,241,0.35)",fontSize:9,fontFamily:"monospace"}} axisLine={false} tickLine={false} width={38} />
-                                <Tooltip content={<Tip />} />
-                                <Area type="monotone" dataKey="Solar" stroke="#ffd60a" fill="rgba(255,214,10,0.2)"  strokeWidth={1.5} dot={false} stackId="re" />
-                                <Area type="monotone" dataKey="Wind"  stroke="#4da6ff" fill="rgba(77,166,255,0.2)"  strokeWidth={1.5} dot={false} stackId="re" />
-                                <Area type="monotone" dataKey="Hydro" stroke="#00d4aa" fill="rgba(0,212,170,0.2)"   strokeWidth={1.5} dot={false} stackId="re" />
-                            </ComposedChart>
-                        </ResponsiveContainer>
-                        <div style={{display:"flex",gap:12,marginTop:6}}>
-                            {[{color:"#ffd60a",label:"Solar (zero at night)"},{color:"#4da6ff",label:"Wind (monsoon peak)"},{color:"#00d4aa",label:"Hydro (post-monsoon peak)"}].map(l=>(
-                                <div key={l.label} style={{display:"flex",alignItems:"center",gap:4,fontSize:10,color:"rgba(232,244,241,0.45)"}}>
-                                    <div style={{width:8,height:8,borderRadius:2,background:l.color}} />{l.label}
-                                </div>
-                            ))}
-                        </div>
-                    </div>
-
-                    {/* Savings breakdown */}
-                    <div style={S.panel}>
-                        <div style={{fontSize:10,color:"rgba(232,244,241,0.45)",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:10,display:"flex",alignItems:"center",gap:6}}>
-                            <span style={dotStyle("#4da6ff")} /> Hourly Savings by Intervention
-                        </div>
-                        <ResponsiveContainer width="100%" height={160}>
-                            <ComposedChart data={savingsData} margin={{top:4,right:12,left:0,bottom:0}}>
-                                <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" vertical={false} />
-                                <XAxis dataKey="label" tick={{fill:"rgba(232,244,241,0.35)",fontSize:9,fontFamily:"monospace"}} axisLine={false} tickLine={false} interval={3} />
-                                <YAxis tick={{fill:"rgba(232,244,241,0.35)",fontSize:9,fontFamily:"monospace"}} axisLine={false} tickLine={false} width={38} />
-                                <Tooltip content={<Tip />} />
-                                <Area type="monotone" dataKey="EV Delay"   stroke="#4da6ff" fill="rgba(77,166,255,0.2)"  strokeWidth={1} dot={false} stackId="1" />
-                                <Area type="monotone" dataKey="Agri Shift" stroke="#c084fc" fill="rgba(192,132,252,0.2)" strokeWidth={1} dot={false} stackId="1" />
-                                <Area type="monotone" dataKey="Ind. Cut"   stroke="#ffb347" fill="rgba(255,179,71,0.2)"  strokeWidth={1} dot={false} stackId="1" />
-                                <Area type="monotone" dataKey="Res. Flex"  stroke="#00d4aa" fill="rgba(0,212,170,0.2)"   strokeWidth={1} dot={false} stackId="1" />
-                                <Area type="monotone" dataKey="Backup"     stroke="#ff4d6a" fill="rgba(255,77,106,0.2)"  strokeWidth={1} dot={false} stackId="1" />
-                            </ComposedChart>
-                        </ResponsiveContainer>
-                    </div>
-
-                    {/* Hourly status strip */}
-                    <div style={S.panel}>
-                        <div style={{fontSize:10,color:"rgba(232,244,241,0.45)",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:10}}>
-                            Hourly Grid Status After Interventions
-                        </div>
-                        <div style={{display:"grid",gridTemplateColumns:"repeat(24,minmax(0,1fr))",gap:3}}>
-                            {simHours.map((h,i)=>{
-                                const ratio = h.dynamicCap>0 ? Math.min(h.final/h.dynamicCap,1) : 0;
+                        <div style={{display:"flex",alignItems:"flex-end",gap:3,height:200,marginBottom:6}}>
+                            {hours.map((h:any) => {
+                                const isActive = activeHour === h.hour;
+                                const isBest   = ins.best_hours?.includes(h.hour);
+                                const isWorst  = ins.worst_hours?.includes(h.hour);
+                                if (tab==="cost") {
+                                    const pct = h.avg_cost_rs_kwh / maxCost * 100;
+                                    const col = h.avg_cost_rs_kwh < 4 ? "#00d4aa" : h.avg_cost_rs_kwh < 5.5 ? "#ffd60a" : "#ff4d6a";
+                                    return (
+                                        <div key={h.hour} onMouseEnter={()=>setActive(h.hour)} onMouseLeave={()=>setActive(null)}
+                                             style={{flex:1,cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",gap:2}}>
+                                            <div style={{width:"100%",height:3,background:isBest?"#00d4aa":isWorst?"#ff4d6a":"transparent",borderRadius:2}}/>
+                                            <div style={{width:"100%",height:`${pct}%`,background:col,opacity:isActive?1:0.75,borderRadius:"2px 2px 0 0",outline:isActive?`2px solid ${col}`:undefined,transition:"opacity 0.15s"}}/>
+                                        </div>
+                                    );
+                                }
+                                if (tab==="carbon") {
+                                    const pct = h.co2_g_kwh / maxCo2 * 100;
+                                    const col = h.co2_g_kwh < 250 ? "#00d4aa" : h.co2_g_kwh < 450 ? "#ffd60a" : "#ff4d6a";
+                                    return (
+                                        <div key={h.hour} onMouseEnter={()=>setActive(h.hour)} onMouseLeave={()=>setActive(null)}
+                                             style={{flex:1,cursor:"pointer",display:"flex",alignItems:"flex-end"}}>
+                                            <div style={{width:"100%",height:`${pct}%`,background:col,opacity:isActive?1:0.75,borderRadius:"2px 2px 0 0"}}/>
+                                        </div>
+                                    );
+                                }
+                                const total = h.gen_required_mw || 1;
                                 return (
-                                    <div key={i} title={`${h.label}: ${(h.final/1000).toFixed(1)} GW / ${(h.dynamicCap/1000).toFixed(1)} GW cap`}
-                                         style={{
-                                             height:44,borderRadius:3,
-                                             background:h.overCapacity?"rgba(255,77,106,0.7)":`rgba(${regionInfo.color==="#4da6ff"?"77,166,255":"0,212,170"},${0.15+ratio*0.65})`,
-                                             border:h.overCapacity?"1px solid rgba(255,77,106,0.8)":"1px solid transparent",
-                                             display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"flex-end",
-                                             paddingBottom:3,cursor:"default",
-                                         }}>
-                                        <span style={{fontFamily:"monospace",fontSize:7,color:h.overCapacity?"#ff4d6a":"rgba(232,244,241,0.5)"}}>{i}</span>
+                                    <div key={h.hour} onMouseEnter={()=>setActive(h.hour)} onMouseLeave={()=>setActive(null)}
+                                         style={{flex:1,cursor:"pointer",height:"100%",display:"flex",flexDirection:"column-reverse",opacity:isActive?1:0.8}}>
+                                        {MERIT_ORDER.map(src => {
+                                            const mw = h.dispatch?.[src.id] ?? 0;
+                                            const pct = mw / total * 100;
+                                            return pct > 0.5 ? <div key={src.id} style={{width:"100%",height:`${pct}%`,background:src.color,flexShrink:0}}/> : null;
+                                        })}
                                     </div>
                                 );
                             })}
                         </div>
-                        <div style={{display:"flex",gap:16,marginTop:8,fontSize:10,color:"rgba(232,244,241,0.4)"}}>
-              <span style={{display:"flex",alignItems:"center",gap:4}}>
-                <span style={{width:10,height:10,borderRadius:2,background:"rgba(0,212,170,0.6)",display:"inline-block"}} /> Safe (vs dynamic cap)
-              </span>
-                            <span style={{display:"flex",alignItems:"center",gap:4}}>
-                <span style={{width:10,height:10,borderRadius:2,background:"rgba(255,77,106,0.7)",display:"inline-block"}} /> Over capacity
-              </span>
-                            <span style={{marginLeft:"auto",fontFamily:"monospace"}}>Hover for MW values</span>
+                        <div style={{display:"flex",gap:3}}>
+                            {hours.map((h:any)=>(
+                                <div key={h.hour} style={{flex:1,textAlign:"center",fontSize:8,color:activeHour===h.hour?"#00d4aa":"rgba(232,244,241,0.3)",fontFamily:"monospace"}}>
+                                    {h.hour%3===0?`${h.hour}h`:""}
+                                </div>
+                            ))}
+                        </div>
+                        <div style={{display:"flex",gap:10,marginTop:8,flexWrap:"wrap"}}>
+                            {tab==="cost" && <>
+                                <span style={{fontSize:10,color:"rgba(232,244,241,0.5)",display:"flex",alignItems:"center",gap:4}}><span style={{width:8,height:8,borderRadius:2,background:"#00d4aa",display:"inline-block"}}/>{"<₹4"}</span>
+                                <span style={{fontSize:10,color:"rgba(232,244,241,0.5)",display:"flex",alignItems:"center",gap:4}}><span style={{width:8,height:8,borderRadius:2,background:"#ffd60a",display:"inline-block"}}/>₹4–5.5</span>
+                                <span style={{fontSize:10,color:"rgba(232,244,241,0.5)",display:"flex",alignItems:"center",gap:4}}><span style={{width:8,height:8,borderRadius:2,background:"#ff4d6a",display:"inline-block"}}/>{">₹5.5"}</span>
+                                <span style={{marginLeft:"auto",fontSize:10,color:"rgba(0,212,170,0.7)"}}>▬ Best</span>
+                                <span style={{fontSize:10,color:"rgba(255,77,106,0.7)"}}>▬ Worst</span>
+                            </>}
+                            {tab==="carbon" && <>
+                                <span style={{fontSize:10,color:"rgba(232,244,241,0.5)",display:"flex",alignItems:"center",gap:4}}><span style={{width:8,height:8,borderRadius:2,background:"#00d4aa",display:"inline-block"}}/>{"<250g"}</span>
+                                <span style={{fontSize:10,color:"rgba(232,244,241,0.5)",display:"flex",alignItems:"center",gap:4}}><span style={{width:8,height:8,borderRadius:2,background:"#ffd60a",display:"inline-block"}}/>250–450g</span>
+                                <span style={{fontSize:10,color:"rgba(232,244,241,0.5)",display:"flex",alignItems:"center",gap:4}}><span style={{width:8,height:8,borderRadius:2,background:"#ff4d6a",display:"inline-block"}}/>{">450g"}</span>
+                            </>}
+                            {tab==="mix" && MERIT_ORDER.slice(0,6).map(s=>(
+                                <span key={s.id} style={{fontSize:10,color:"rgba(232,244,241,0.5)",display:"flex",alignItems:"center",gap:4}}>
+                  <span style={{width:8,height:8,borderRadius:2,background:s.color,display:"inline-block"}}/>{s.label}
+                </span>
+                            ))}
                         </div>
                     </div>
 
+                    {/* Hour detail */}
+                    <div style={S.panel}>
+                        {active ? <>
+                            <div style={{fontFamily:"monospace",fontSize:22,fontWeight:700,color:active.color,marginBottom:2}}>{active.label}</div>
+                            <div style={{fontSize:10,color:"rgba(232,244,241,0.4)",marginBottom:12}}>{active.cost_label} · {active.co2_intensity_label} carbon</div>
+                            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:12}}>
+                                {[
+                                    {l:"Demand",   v:`${(active.demand_mw/1000).toFixed(1)} GW`, c:"#e8f4f1"},
+                                    {l:"Cost",     v:`₹${active.avg_cost_rs_kwh}/kWh`,           c:"#ffd60a"},
+                                    {l:"CO₂",      v:`${active.co2_g_kwh} g/kWh`,                c:"#4da6ff"},
+                                    {l:"RE share", v:`${active.renewable_pct?.toFixed(0)}%`,      c:"#00d4aa"},
+                                    {l:"Marginal", v:`₹${active.marginal_cost}/kWh`,             c:"#ffb347"},
+                                    {l:"Curtailed",v:`${(active.curtailed_mw/1000).toFixed(1)} GW`, c:"#ff4d6a"},
+                                ].map(m=>(
+                                    <div key={m.l} style={{background:"rgba(255,255,255,0.03)",borderRadius:5,padding:"6px 8px"}}>
+                                        <div style={{fontFamily:"monospace",fontSize:13,fontWeight:700,color:m.c}}>{m.v}</div>
+                                        <div style={{fontSize:9,color:"rgba(232,244,241,0.4)"}}>{m.l}</div>
+                                    </div>
+                                ))}
+                            </div>
+                            <div style={S.lbl}>Dispatch mix</div>
+                            <div style={{display:"flex",flexDirection:"column",gap:5}}>
+                                {MERIT_ORDER.map(src => {
+                                    const mw = active.dispatch?.[src.id] ?? 0;
+                                    if (mw < 10) return null;
+                                    return (
+                                        <div key={src.id}>
+                                            <div style={{display:"flex",justifyContent:"space-between",fontSize:9,color:"rgba(232,244,241,0.55)",marginBottom:2}}>
+                        <span style={{display:"flex",alignItems:"center",gap:4}}>
+                          <span style={{width:6,height:6,borderRadius:1,background:src.color,display:"inline-block"}}/>
+                            {src.label}
+                        </span>
+                                                <span style={{fontFamily:"monospace"}}>{(mw/1000).toFixed(1)} GW</span>
+                                            </div>
+                                            <MiniBar value={mw} max={active.gen_required_mw} color={src.color}/>
+                                        </div>
+                                    );
+                                })}
+                            </div>
+                        </> : (
+                            <div style={{height:"100%",display:"flex",flexDirection:"column",justifyContent:"center",alignItems:"center",gap:10,color:"rgba(232,244,241,0.25)"}}>
+                                <div style={{fontSize:32}}>👆</div>
+                                <div style={{fontSize:11,fontFamily:"monospace",textAlign:"center"}}>Hover a bar to see<br/>dispatch details</div>
+                            </div>
+                        )}
+                    </div>
                 </div>
-            </div>
+
+                {/* Bottom: merit order table + explainer */}
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14}}>
+                    <div style={S.panel}>
+                        <div style={S.lbl}>India Merit Order — Dispatch Priority (cheapest first)</div>
+                        <div style={{display:"flex",flexDirection:"column",gap:4}}>
+                            {MERIT_ORDER.map((s,i)=>(
+                                <div key={s.id} style={{display:"flex",alignItems:"center",gap:10,padding:"7px 10px",background:"rgba(255,255,255,0.02)",borderRadius:5,borderLeft:`3px solid ${s.color}`}}>
+                                    <div style={{fontFamily:"monospace",fontSize:11,color:"rgba(232,244,241,0.3)",width:14}}>{i+1}</div>
+                                    <div style={{flex:1}}>
+                                        <div style={{fontSize:11,fontWeight:500,color:"rgba(232,244,241,0.8)"}}>{s.label}</div>
+                                        <div style={{fontSize:9,color:"rgba(232,244,241,0.4)",marginTop:1}}>{s.co2===0?"Zero carbon":`${(s.co2*1000).toFixed(0)} g CO₂/kWh`}</div>
+                                    </div>
+                                    <div style={{textAlign:"right"}}>
+                                        <div style={{fontFamily:"monospace",fontSize:12,color:s.color}}>₹{s.cost}/kWh</div>
+                                        <div style={{fontSize:9,color:"rgba(232,244,241,0.3)"}}>variable cost</div>
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                        <div style={{marginTop:10,fontSize:9,color:"rgba(232,244,241,0.3)",lineHeight:1.6}}>
+                            Variable cost = what the grid pays per additional kWh. Cheapest dispatched first.<br/>
+                            The last (marginal) source dispatched sets the system marginal cost.<br/>
+                            Sources: MERIT India, CERC 2024-25, IISD 2025, CEA emission factor 0.477 kg/kWh.
+                        </div>
+                    </div>
+                    <div style={S.panel}>
+                        <div style={S.lbl}>Why Carbon Intensity Varies Through the Day</div>
+                        <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                            {[
+                                {icon:"☀",color:"#ffd60a",title:"10:00–16:00 — Solar window",
+                                    detail:"India's 300+ GW solar displaces coal at midday. Carbon drops to 200–300 g/kWh and cost falls to ₹3–4/kWh. Cheapest, cleanest window of the day."},
+                                {icon:"🌙",color:"#4da6ff",title:"19:00–23:00 — Evening coal peak",
+                                    detail:"Solar drops to zero but demand peaks. Coal fills the gap entirely. Carbon spikes to 500–650 g/kWh, cost jumps to ₹5.5–6.5/kWh — 2× midday rates."},
+                                {icon:"⚡",color:"#ff4d6a",title:"43 GW sitting idle",
+                                    detail:"India has 43 GW of cheap solar/wind without PPAs being curtailed while expensive coal runs. Shifting flexible loads to solar hours saves money and cuts emissions simultaneously."},
+                                {icon:"📊",color:"#00d4aa",title:"T&D losses add 19.2%",
+                                    detail:"Every unit consumed requires 1.23 units generated. Transmission losses mean your marginal carbon is always higher than the plant emission factor."},
+                            ].map(s=>(
+                                <div key={s.title} style={{display:"flex",gap:10,padding:"8px 10px",background:"rgba(255,255,255,0.02)",borderRadius:6,borderLeft:`3px solid ${s.color}`}}>
+                                    <span style={{fontSize:16,flexShrink:0}}>{s.icon}</span>
+                                    <div>
+                                        <div style={{fontSize:11,fontWeight:500,color:s.color,marginBottom:2}}>{s.title}</div>
+                                        <div style={{fontSize:10,color:"rgba(232,244,241,0.5)",lineHeight:1.5}}>{s.detail}</div>
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                </div>
+            </>}
         </div>
     );
 }

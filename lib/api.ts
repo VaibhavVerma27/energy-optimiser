@@ -85,6 +85,19 @@ export interface ForecastStatus {
 
 // ── API calls ─────────────────────────────────────────────────────────────────
 
+export interface WeatherOverride {
+    temp_c:    number;   // ambient temperature °C
+    humidity:  number;   // relative humidity %
+    solar_wm2?: number;  // solar irradiance W/m² (omit = derive from time+humidity)
+}
+
+export interface HolidayOverride {
+    is_national_holiday?: number;
+    is_major_festival?:   number;
+    is_diwali_window?:    number;
+    is_pre_festival?:     number;
+}
+
 export interface CustomForecastInput {
     // 168 hourly MW values per region (last 7 days).
     // If omitted the backend uses the last 168 rows of data/demand.csv.
@@ -94,8 +107,12 @@ export interface CustomForecastInput {
     Southern_Region_mw?:     number[];
     NorthEastern_Region_mw?: number[];
     demand_mw?:              number[];
-    // ISO datetime for the first forecast hour (default: now rounded to hour)
+    // ISO datetime for the first forecast hour — send as-is (no UTC conversion)
     start_datetime?: string;
+    // Weather overrides: keyed by region_col e.g. "Northern_Region_mw"
+    weather_overrides?: Record<string, WeatherOverride>;
+    // Holiday overrides
+    holiday_overrides?: HolidayOverride;
 }
 
 /** Fetch 24h forecast for all 5 regions + national in one call.
@@ -195,6 +212,13 @@ export async function fetchCapacity24h(region: string, month?: number): Promise<
     const params = new URLSearchParams({ region });
     if (month) params.set("month", String(month));
     const res = await fetch(`${BASE}/api/capacity/24h?${params}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+}
+
+export async function fetchMeritDispatch(date?: string): Promise<any> {
+    const params = date ? `?date=${date}` : "";
+    const res = await fetch(`${BASE}/api/simulation/merit-dispatch${params}`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return res.json();
 }

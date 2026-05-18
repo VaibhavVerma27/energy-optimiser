@@ -1,319 +1,438 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import {
-    fetchAllRegionsCapacity, fetchCapacity24h,
-    type AllRegionsCapacity, type CapacityHour,
-} from "../../lib/api";
-import {
-    ResponsiveContainer, ComposedChart, Area, Line, Bar, BarChart,
-    XAxis, YAxis, Tooltip, CartesianGrid, ReferenceLine,
-} from "recharts";
+import { useEffect, useState, useCallback } from "react";
 
 const REGIONS = [
-    { id: "Northern_Region",     label: "Northern",      short: "NR",  color: "#4da6ff" },
-    { id: "Western_Region",      label: "Western",       short: "WR",  color: "#ffb347" },
-    { id: "Southern_Region",     label: "Southern",      short: "SR",  color: "#00d4aa" },
-    { id: "Eastern_Region",      label: "Eastern",       short: "ER",  color: "#ff4d6a" },
-    { id: "NorthEastern_Region", label: "North-Eastern", short: "NER", color: "#c084fc" },
+    { id:"Northern_Region",     label:"Northern", color:"#4da6ff" },
+    { id:"Western_Region",      label:"Western",  color:"#ffb347" },
+    { id:"Southern_Region",     label:"Southern", color:"#00d4aa" },
+    { id:"Eastern_Region",      label:"Eastern",  color:"#ff4d6a" },
+    { id:"NorthEastern_Region", label:"NE",       color:"#c084fc" },
 ];
 
-const SOURCE_COLORS: Record<string, string> = {
-    thermal: "#ff6b35",
-    solar:   "#ffd60a",
-    wind:    "#4da6ff",
-    hydro:   "#00d4aa",
-    nuclear: "#c084fc",
-    other:   "#888",
-};
+const SOURCES = [
+    { key:"thermal", label:"Thermal",  color:"#ff6b35" },
+    { key:"solar",   label:"Solar",    color:"#ffd60a" },
+    { key:"wind",    label:"Wind",     color:"#4da6ff" },
+    { key:"hydro",   label:"Hydro",    color:"#00d4aa" },
+    { key:"nuclear", label:"Nuclear",  color:"#c084fc" },
+    { key:"other",   label:"Other RE", color:"#888888" },
+];
 
-const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+const BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
-function NavLink({href,label,active}:{href:string;label:string;active?:boolean}) {
+const Tip = ({active,payload,label}:any) => {
+    if (!active||!payload?.length) return null;
     return (
-        <a href={href} style={{
-            fontFamily:"monospace", fontSize:10, letterSpacing:"0.08em",
-            textDecoration:"none", padding:"4px 12px", borderRadius:5,
-            background: active?"rgba(0,212,170,0.12)":"transparent",
-            color: active?"#00d4aa":"rgba(232,244,241,0.4)",
-            border: active?"1px solid rgba(0,212,170,0.25)":"1px solid transparent",
-        }}>{label}</a>
-    );
-}
-
-const CustomTooltip = ({active,payload,label}:any) => {
-    if (!active || !payload?.length) return null;
-    return (
-        <div style={{background:"#0d1821", border:"1px solid rgba(0,212,170,0.25)", borderRadius:6, padding:"10px 14px", fontSize:11}}>
-            <p style={{color:"#00d4aa", marginBottom:6, fontFamily:"monospace"}}>{label}</p>
-            {payload.map((p:any) => (
-                <p key={p.name} style={{color:p.color??p.fill??"#e8f4f1", margin:"2px 0"}}>
-                    {p.name}: <strong>{typeof p.value === "number" ? `${p.value.toLocaleString()} MW` : p.value}</strong>
+        <div style={{background:"#0d1821",border:"1px solid rgba(0,212,170,0.25)",borderRadius:6,padding:"9px 13px",fontSize:11}}>
+            <p style={{color:"#00d4aa",marginBottom:4,fontFamily:"monospace"}}>{label}</p>
+            {payload.map((p:any)=>(
+                <p key={p.name} style={{color:p.color??p.fill??"#e8f4f1",margin:"2px 0"}}>
+                    {p.name}: <strong>{typeof p.value==="number"?`${(p.value/1000).toFixed(1)} GW`:p.value}</strong>
                 </p>
             ))}
         </div>
     );
 };
 
-export default function CapacityPage() {
-    const [allCap, setAllCap]       = useState<AllRegionsCapacity|null>(null);
-    const [cap24h, setCap24h]       = useState<CapacityHour[]>([]);
-    const [selectedRegion, setRegion] = useState("Northern_Region");
-    const [selectedMonth, setMonth]   = useState<number>(new Date().getMonth()+1);
-    const [loading, setLoading]       = useState(true);
-    const [lastRefresh, setLastRefresh] = useState("");
+async function fetchAllIndia24h(weather?: {solar:number[],temp:number[],wind:number[]}): Promise<any> {
+    const params = new URLSearchParams();
+    if (weather) {
+        params.set("solar_wm2", weather.solar.join(","));
+        params.set("temp_c",    weather.temp.join(","));
+        params.set("wind_ms",   weather.wind.join(","));
+    }
+    const res = await fetch(`${BASE}/api/capacity/all-india-24h?${params}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+}
 
-    const load = async () => {
+async function fetchRegion24h(region:string, weather?: {solar:number[],temp:number[],wind:number[]}): Promise<any> {
+    const params = new URLSearchParams({ region });
+    if (weather) {
+        params.set("solar_wm2", weather.solar.join(","));
+        params.set("temp_c",    weather.temp.join(","));
+        params.set("wind_ms",   weather.wind.join(","));
+    }
+    const res = await fetch(`${BASE}/api/capacity/24h?${params}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+}
+
+async function fetchWeather(): Promise<any> {
+    // Use live weather endpoint to get today's weather for Delhi (representative)
+    const res = await fetch(`${BASE}/api/live/weather?hours_ahead=24`);
+    if (!res.ok) return null;
+    return res.json();
+}
+
+async function fetchAllRegionsCurrent(): Promise<any> {
+    const res = await fetch(`${BASE}/api/capacity/all-regions`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+}
+
+export default function CapacityPage() {
+    const [hourlyData, setHourlyData]     = useState<any[]>([]);
+    const [allCap,     setAllCap]         = useState<any>(null);
+    const [loading,    setLoading]        = useState(true);
+    const [weather,    setWeather]        = useState<{solar:number[],temp:number[],wind:number[]}|null>(null);
+    const [weatherUsed, setWeatherUsed]   = useState(false);
+    const [selectedRegion, setRegion]     = useState("ALL_INDIA");
+    const [activeHour, setActiveHour]     = useState<number|null>(null);
+    const [lastRefresh, setLastRefresh]   = useState("");
+
+    const loadWeather = async () => {
+        try {
+            const wx = await fetchWeather();
+            if (wx?.Northern_Region && Array.isArray(wx.Northern_Region)) {
+                const arr = wx.Northern_Region.slice(0, 24);
+                const solar = arr.map((h:any) => h.solar_wm2 ?? 0);
+                const temp  = arr.map((h:any) => h.temp_c ?? 30);
+                const wind  = arr.map((h:any) => h.wind_speed_ms ?? 4);
+                return { solar, temp, wind };
+            }
+        } catch(e) {}
+        return null;
+    };
+
+    const load = useCallback(async () => {
         setLoading(true);
         try {
-            const [ac, c24] = await Promise.all([
-                fetchAllRegionsCapacity(),
-                fetchCapacity24h(selectedRegion, selectedMonth),
+            const [wxData, current] = await Promise.all([
+                loadWeather(),
+                fetchAllRegionsCurrent(),
             ]);
-            setAllCap(ac);
-            setCap24h(c24.hours);
-            setLastRefresh(new Date().toLocaleTimeString());
-        } catch(e) {
-            console.error(e);
-        } finally {
-            setLoading(false);
-        }
+            setWeather(wxData);
+            setAllCap(current);
+
+            if (selectedRegion === "ALL_INDIA") {
+                const d = await fetchAllIndia24h(wxData || undefined);
+                setHourlyData(d.hours ?? []);
+                setWeatherUsed(d.weather_used);
+            } else {
+                const d = await fetchRegion24h(selectedRegion, wxData || undefined);
+                setHourlyData(d.hours ?? []);
+                setWeatherUsed(d.weather_used);
+            }
+            setLastRefresh(new Date().toLocaleTimeString("en-IN",{timeZone:"Asia/Kolkata",hour:"2-digit",minute:"2-digit"}));
+        } catch(e) { console.error(e); }
+        setLoading(false);
+    }, [selectedRegion]);
+
+    useEffect(() => { load(); }, [load]);
+
+    const nowHour  = new Date().getHours();
+    const maxTotal = Math.max(...hourlyData.map(h => h.total_available_mw), 1);
+    const activeH  = activeHour != null ? hourlyData.find(h => h.hour === activeHour) : hourlyData[nowHour];
+
+    const ai = allCap?.all_india;
+    const installedTotal = 532740;
+    const availableTotal = ai?.total_available_mw ?? 0;
+
+    const S: any = {
+        root:  {minHeight:"100vh",background:"#0a0f14",color:"#e8f4f1",fontFamily:"'Exo 2','Segoe UI',sans-serif",padding:"12px 24px"},
+        panel: {background:"rgba(255,255,255,0.025)",border:"1px solid rgba(255,255,255,0.07)",borderRadius:8,padding:16},
+        lbl:   {fontSize:10,letterSpacing:"0.12em",color:"rgba(232,244,241,0.4)",textTransform:"uppercase" as const,marginBottom:10},
     };
-
-    useEffect(()=>{ load(); }, [selectedRegion, selectedMonth]);
-
-    const S: Record<string, React.CSSProperties> = {
-        root: {minHeight:"100vh", background:"#0a0f14", color:"#e8f4f1", fontFamily:"'Exo 2','Segoe UI',sans-serif", padding:"20px 24px"},
-        header: {display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:20, paddingBottom:14, borderBottom:"1px solid rgba(255,255,255,0.08)"},
-        title: {fontFamily:"monospace", fontSize:13, letterSpacing:"0.15em", color:"#00d4aa", textTransform:"uppercase"},
-        panel: {background:"rgba(255,255,255,0.025)", border:"1px solid rgba(255,255,255,0.07)", borderRadius:8, padding:16},
-        panelTitle: {fontSize:10, letterSpacing:"0.12em", color:"rgba(232,244,241,0.45)", textTransform:"uppercase", marginBottom:12},
-        twoCol: {display:"grid", gridTemplateColumns:"1fr 1fr", gap:14, marginBottom:14},
-        threeCol: {display:"grid", gridTemplateColumns:"repeat(3,minmax(0,1fr))", gap:14, marginBottom:14},
-        fiveCol: {display:"grid", gridTemplateColumns:"repeat(5,minmax(0,1fr))", gap:10, marginBottom:14},
-        select: {background:"rgba(255,255,255,0.05)", border:"1px solid rgba(255,255,255,0.1)", color:"#e8f4f1", borderRadius:6, padding:"4px 10px", fontSize:11, fontFamily:"monospace"},
-    };
-
-    // Build stacked chart data
-    const stackedData = cap24h.map(h => ({
-        label: h.label,
-        Thermal: h.breakdown_mw.thermal ?? 0,
-        Hydro:   h.breakdown_mw.hydro   ?? 0,
-        Solar:   h.breakdown_mw.solar   ?? 0,
-        Wind:    h.breakdown_mw.wind    ?? 0,
-        Nuclear: h.breakdown_mw.nuclear ?? 0,
-        Other:   h.breakdown_mw.other   ?? 0,
-    }));
-
-    // CF chart data
-    const cfData = cap24h.map(h => ({
-        label:    h.label,
-        "Solar CF":   Math.round(h.solar_cf * 100),
-        "Wind CF":    Math.round(h.wind_cf * 100),
-        "Hydro CF":   Math.round(h.hydro_cf * 100),
-        "Thermal CF": Math.round(h.thermal_cf * 100),
-    }));
-
-    const currentRegionCap = allCap?.regions?.[selectedRegion];
-    const allIndia = allCap?.all_india;
 
     return (
         <div style={S.root}>
             {/* Header */}
-            <div style={S.header}>
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:20,paddingTop:4}}>
                 <div>
-                    <div style={S.title}>⚡ Dynamic Grid Capacity — India POSOCO</div>
-                    <div style={{fontSize:11, color:"rgba(232,244,241,0.4)", marginTop:3, fontFamily:"monospace"}}>
-                        Real-time available capacity based on solar irradiance · wind speed · hydro reservoirs · thermal PLF
-                        {lastRefresh && ` · ${lastRefresh}`}
+                    <div style={{fontFamily:"monospace",fontSize:13,letterSpacing:"0.15em",color:"#00d4aa",textTransform:"uppercase"}}>
+                        ⚡ Grid Capacity — India (CEA Mar 2026)
+                    </div>
+                    <div style={{fontSize:11,color:"rgba(232,244,241,0.4)",marginTop:2}}>
+                        Hourly available capacity · weather-adjusted · 532 GW installed
+                        {weatherUsed && <span style={{color:"#ffd60a",marginLeft:8}}>☀ Live weather applied</span>}
+                        {lastRefresh && <span style={{marginLeft:8}}>· {lastRefresh} IST</span>}
                     </div>
                 </div>
-                <div style={{display:"flex", alignItems:"center", gap:8}}>
-                    <NavLink href="/" label="Dashboard" />
-                    <NavLink href="/simulation" label="Simulator" />
-                    <NavLink href="/capacity" label="Capacity" active />
-                    <NavLink href="/insights" label="ML Insights" />
-                    <NavLink href="/history" label="History" />
+                <div style={{display:"flex",alignItems:"center",gap:8}}>
+
+
+
+
+                    <select value={selectedRegion} onChange={e=>setRegion(e.target.value)}
+                            style={{background:"rgba(255,255,255,0.05)",border:"1px solid rgba(255,255,255,0.1)",color:"#e8f4f1",borderRadius:6,padding:"4px 10px",fontSize:11,fontFamily:"monospace"}}>
+                        <option value="ALL_INDIA">🇮🇳 All India</option>
+                        {REGIONS.map(r=><option key={r.id} value={r.id}>{r.label} Region</option>)}
+                    </select>
+                    <button onClick={load} style={{background:"transparent",border:"1px solid rgba(0,212,170,0.3)",color:"#00d4aa",borderRadius:6,padding:"4px 12px",fontFamily:"monospace",fontSize:10,cursor:"pointer"}}>
+                        {loading?"Loading…":"↻ Refresh"}
+                    </button>
                 </div>
             </div>
 
-            {/* Controls */}
-            <div style={{display:"flex", gap:12, marginBottom:16, alignItems:"center"}}>
-                <span style={{fontSize:11, color:"rgba(232,244,241,0.5)"}}>Region:</span>
-                <select value={selectedRegion} onChange={e=>setRegion(e.target.value)} style={S.select}>
-                    {REGIONS.map(r=><option key={r.id} value={r.id}>{r.label} Region</option>)}
-                </select>
-                <span style={{fontSize:11, color:"rgba(232,244,241,0.5)"}}>Month:</span>
-                <select value={selectedMonth} onChange={e=>setMonth(Number(e.target.value))} style={S.select}>
-                    {MONTHS.map((m,i)=><option key={i} value={i+1}>{m}</option>)}
-                </select>
-                <button onClick={load} style={{background:"transparent", border:"1px solid rgba(0,212,170,0.3)", color:"#00d4aa", borderRadius:6, padding:"4px 12px", fontFamily:"monospace", fontSize:10, cursor:"pointer"}}>
-                    {loading?"Loading…":"Refresh"}
-                </button>
-            </div>
+            {/* All-India KPI row — shown only when All India selected */}
+            {ai && selectedRegion === "ALL_INDIA" && (
+                <>
+                    <div style={{display:"grid",gridTemplateColumns:"repeat(5,minmax(0,1fr))",gap:10,marginBottom:10}}>
+                        {[
+                            {l:"Available Now",    v:`${(availableTotal/1000).toFixed(0)} GW`,  s:`of ${(installedTotal/1000).toFixed(0)} GW installed`, c:"#00d4aa"},
+                            {l:"Thermal",          v:`${(ai.thermal_mw/1000).toFixed(0)} GW`,   s:"Base load — constant 24h",                            c:"#ff6b35"},
+                            {l:"Renewable Now",    v:`${(ai.renewable_mw/1000).toFixed(0)} GW`, s:`${ai.renewable_pct}% of available`,                   c:"#ffd60a"},
+                            {l:"Solar + Wind",     v:`${((ai.solar_mw??0)+(ai.wind_mw??0) > 0 ? ((ai.solar_mw??0)+(ai.wind_mw??0)) : 0)/1000 < 0.5 ? "—" : ((((ai.solar_mw??0)+(ai.wind_mw??0))/1000).toFixed(0)+" GW")}`, s:"Variable renewables this hour", c:"#4da6ff"},
+                            {l:"Utilisation",      v:`${Math.round(availableTotal/installedTotal*100)}%`, s:"Available / Installed",                      c:"#c084fc"},
+                        ].map(m=>(
+                            <div key={m.l} style={{...S.panel,borderTop:`2px solid ${m.c}`,padding:"12px 14px"}}>
+                                <div style={{fontFamily:"monospace",fontSize:22,fontWeight:700,color:m.c}}>{m.v}</div>
+                                <div style={{fontSize:10,color:"rgba(232,244,241,0.5)",marginTop:3}}>{m.l}</div>
+                                <div style={{fontSize:9,color:"rgba(232,244,241,0.3)",marginTop:2}}>{m.s}</div>
+                            </div>
+                        ))}
+                    </div>
 
-            {/* All-India snapshot cards */}
-            {allIndia && (
-                <div style={S.fiveCol}>
-                    {[
-                        {label:"Total Available",  value:`${(allIndia.total_available_mw/1000).toFixed(0)} GW`, color:"#00d4aa", sub:"All India right now"},
-                        {label:"Renewable",        value:`${(allIndia.renewable_mw/1000).toFixed(0)} GW`,       color:"#4da6ff", sub:`${allIndia.renewable_pct}% of available`},
-                        {label:"Thermal",          value:`${(allIndia.thermal_mw/1000).toFixed(0)} GW`,          color:"#ff6b35", sub:"Coal + Gas + Oil"},
-                        {label:"Renewable %",      value:`${allIndia.renewable_pct}%`,                            color:"#00d4aa", sub:"Of available capacity"},
-                        {label:"Installed Total",  value:`${(allIndia.installed_mw/1000).toFixed(0)} GW`,        color:"rgba(232,244,241,0.5)", sub:"CEA 2023-24"},
-                    ].map(s=>(
-                        <div key={s.label} style={{background:"rgba(255,255,255,0.03)", border:"1px solid rgba(255,255,255,0.07)", borderRadius:8, padding:"12px 14px", borderTop:`2px solid ${s.color}`}}>
-                            <div style={{fontSize:9, color:"rgba(232,244,241,0.4)", textTransform:"uppercase", letterSpacing:"0.1em", marginBottom:4}}>{s.label}</div>
-                            <div style={{fontFamily:"monospace", fontSize:20, color:s.color}}>{s.value}</div>
-                            <div style={{fontSize:9, color:"rgba(232,244,241,0.35)", marginTop:2}}>{s.sub}</div>
+                    {/* Installed vs available bar */}
+                    <div style={{...S.panel,marginBottom:14,padding:"12px 16px"}}>
+                        <div style={{display:"flex",justifyContent:"space-between",fontSize:10,color:"rgba(232,244,241,0.4)",marginBottom:6}}>
+                            <span>Installed vs Available — All India (this hour)</span>
+                            <span style={{fontFamily:"monospace"}}>{(availableTotal/1000).toFixed(0)} GW available of 532 GW installed</span>
                         </div>
-                    ))}
-                </div>
+                        <div style={{height:20,background:"rgba(255,255,255,0.05)",borderRadius:4,overflow:"hidden",position:"relative",display:"flex"}}>
+                            {SOURCES.map(s => {
+                                const mw = (allCap?.all_india as any)?.[s.key+"_mw"] ?? 0;
+                                const pct = mw / installedTotal * 100;
+                                return pct > 0.3 ? (
+                                    <div key={s.key} title={`${s.label}: ${(mw/1000).toFixed(1)} GW`}
+                                         style={{height:"100%",width:`${pct}%`,background:s.color,opacity:0.85}}/>
+                                ) : null;
+                            })}
+                            <div style={{position:"absolute",top:0,bottom:0,right:0,
+                                width:`${(1-availableTotal/installedTotal)*100}%`,
+                                background:"rgba(255,255,255,0.05)",borderLeft:"1px dashed rgba(255,255,255,0.15)"}}>
+              <span style={{position:"absolute",left:4,top:"50%",transform:"translateY(-50%)",fontSize:8,color:"rgba(232,244,241,0.3)"}}>
+                planned outage
+              </span>
+                            </div>
+                        </div>
+                    </div>
+                </>
             )}
 
-            {/* All-region capacity cards */}
-            <div style={{display:"grid", gridTemplateColumns:"repeat(5,minmax(0,1fr))", gap:10, marginBottom:14}}>
-                {REGIONS.map(r=>{
+            {/* Region cards (5 region mini-cards, always shown) */}
+            <div style={{display:"grid",gridTemplateColumns:"repeat(5,minmax(0,1fr))",gap:10,marginBottom:14}}>
+                {REGIONS.map(r => {
                     const cap = allCap?.regions?.[r.id];
-                    const renewPct = cap ? Math.round((cap.renewable_mw / cap.total_available_mw)*100) : 0;
-                    const alerts = cap?.alerts ?? [];
+                    const b   = cap?.breakdown_mw ?? {};
+                    const total = cap?.total_available_mw ?? 0;
+                    const isSelected = selectedRegion === r.id;
                     return (
                         <div key={r.id} onClick={()=>setRegion(r.id)} style={{
-                            background: selectedRegion===r.id?`${r.color}10`:"rgba(255,255,255,0.025)",
-                            border:`1px solid ${selectedRegion===r.id?r.color+"50":"rgba(255,255,255,0.07)"}`,
-                            borderLeft:`3px solid ${r.color}`, borderRadius:8, padding:"12px 14px", cursor:"pointer",
+                            ...S.panel, borderTop:`2px solid ${r.color}`,
+                            cursor:"pointer",
+                            outline:isSelected?`1px solid ${r.color}40`:undefined,
+                            background:isSelected?"rgba(255,255,255,0.04)":"rgba(255,255,255,0.025)",
                         }}>
-                            <div style={{fontFamily:"monospace", fontSize:9, color:r.color, marginBottom:3}}>{r.short}</div>
-                            <div style={{fontSize:12, fontWeight:500, color:"#e8f4f1", marginBottom:8}}>{r.label}</div>
-                            {cap ? (
-                                <>
-                                    <div style={{fontFamily:"monospace", fontSize:18, color:r.color, marginBottom:4}}>
-                                        {(cap.total_available_mw/1000).toFixed(1)} GW
-                                    </div>
-                                    <div style={{fontSize:10, color:"rgba(232,244,241,0.4)", marginBottom:6}}>available now</div>
-                                    {/* Source mini-bars */}
-                                    {["thermal","solar","wind","hydro"].map(src=>{
-                                        const mw  = cap.breakdown_mw[src] ?? 0;
-                                        const pct = Math.round((mw/cap.total_available_mw)*100);
-                                        return (
-                                            <div key={src} style={{display:"flex", alignItems:"center", gap:5, marginBottom:3}}>
-                                                <div style={{width:6, height:6, borderRadius:1, background:SOURCE_COLORS[src], flexShrink:0}} />
-                                                <div style={{flex:1, height:4, background:"rgba(255,255,255,0.06)", borderRadius:2, overflow:"hidden"}}>
-                                                    <div style={{height:"100%", width:`${pct}%`, background:SOURCE_COLORS[src], opacity:0.7}} />
-                                                </div>
-                                                <span style={{fontFamily:"monospace", fontSize:9, color:"rgba(232,244,241,0.4)", width:30}}>{pct}%</span>
-                                            </div>
-                                        );
-                                    })}
-                                    {alerts.length > 0 && (
-                                        <div style={{marginTop:6, fontSize:9, color:"#ffb347", lineHeight:1.5}}>
-                                            {alerts[0]}
+                            <div style={{fontSize:12,fontWeight:600,color:r.color,marginBottom:4}}>{r.label}</div>
+                            <div style={{fontFamily:"monospace",fontSize:18,fontWeight:700,color:"#e8f4f1",marginBottom:4}}>
+                                {total>0?(total/1000).toFixed(1):"—"} GW
+                            </div>
+                            <div style={{fontSize:9,color:"rgba(232,244,241,0.3)",marginBottom:6}}>available now</div>
+                            {SOURCES.filter(s=>(b as any)[s.key]>0).map(s=>{
+                                const mw  = (b as any)[s.key] ?? 0;
+                                const pct = total>0?Math.round(mw/total*100):0;
+                                return (
+                                    <div key={s.key} style={{marginBottom:3}}>
+                                        <div style={{display:"flex",justifyContent:"space-between",fontSize:9,color:"rgba(232,244,241,0.4)",marginBottom:1}}>
+                                            <span>{s.label}</span>
+                                            <span style={{fontFamily:"monospace"}}>{(mw/1000).toFixed(1)}</span>
                                         </div>
-                                    )}
-                                </>
-                            ) : <div style={{fontSize:11, color:"rgba(232,244,241,0.3)"}}>Loading…</div>}
+                                        <div style={{height:3,background:"rgba(255,255,255,0.06)",borderRadius:2}}>
+                                            <div style={{height:"100%",width:`${pct}%`,background:s.color,opacity:0.8,borderRadius:2}}/>
+                                        </div>
+                                    </div>
+                                );
+                            })}
                         </div>
                     );
                 })}
             </div>
 
-            {/* 24h stacked capacity chart */}
-            <div style={{...S.panel, marginBottom:14}}>
-                <div style={{display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:12}}>
-                    <div style={S.panelTitle}>
-                        24-Hour Available Capacity Stack — {REGIONS.find(r=>r.id===selectedRegion)?.label} Region · {MONTHS[selectedMonth-1]}
-                    </div>
-                    <div style={{display:"flex", gap:12, flexWrap:"wrap"}}>
-                        {Object.entries(SOURCE_COLORS).map(([src,col])=>(
-                            <div key={src} style={{display:"flex", alignItems:"center", gap:4, fontSize:10, color:"rgba(232,244,241,0.5)"}}>
-                                <div style={{width:8, height:8, borderRadius:2, background:col}} />
-                                {src.charAt(0).toUpperCase()+src.slice(1)}
-                            </div>
-                        ))}
-                    </div>
-                </div>
-                <ResponsiveContainer width="100%" height={240}>
-                    <BarChart data={stackedData} margin={{top:4, right:12, left:0, bottom:0}}>
-                        <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" vertical={false} />
-                        <XAxis dataKey="label" tick={{fill:"rgba(232,244,241,0.35)", fontSize:9, fontFamily:"monospace"}} axisLine={false} tickLine={false} interval={3} />
-                        <YAxis tickFormatter={(v:number)=>`${(v/1000).toFixed(0)}K`} tick={{fill:"rgba(232,244,241,0.35)", fontSize:9, fontFamily:"monospace"}} axisLine={false} tickLine={false} width={38} />
-                        <Tooltip content={<CustomTooltip />} />
-                        <Bar dataKey="Thermal" stackId="a" fill={SOURCE_COLORS.thermal} fillOpacity={0.85} />
-                        <Bar dataKey="Hydro"   stackId="a" fill={SOURCE_COLORS.hydro}   fillOpacity={0.85} />
-                        <Bar dataKey="Nuclear" stackId="a" fill={SOURCE_COLORS.nuclear} fillOpacity={0.85} />
-                        <Bar dataKey="Wind"    stackId="a" fill={SOURCE_COLORS.wind}    fillOpacity={0.85} />
-                        <Bar dataKey="Solar"   stackId="a" fill={SOURCE_COLORS.solar}   fillOpacity={0.85} radius={[3,3,0,0]} />
-                        <Bar dataKey="Other"   stackId="a" fill={SOURCE_COLORS.other}   fillOpacity={0.85} />
-                    </BarChart>
-                </ResponsiveContainer>
-                <div style={{marginTop:10, fontSize:10, color:"rgba(232,244,241,0.35)"}}>
-                    Solar output drops to zero at night. Wind peaks during monsoon months. Hydro peaks post-monsoon (Sep-Nov). Thermal remains relatively stable with scheduled maintenance dips in Mar-May.
-                </div>
-            </div>
-
-            {/* Capacity factor chart */}
-            <div style={S.twoCol}>
+            {/* Main: 24h hourly chart + detail panel */}
+            <div style={{display:"grid",gridTemplateColumns:"1fr 300px",gap:14,marginBottom:14}}>
                 <div style={S.panel}>
-                    <div style={S.panelTitle}>Capacity Factors by Source — Hourly Variation</div>
-                    <ResponsiveContainer width="100%" height={200}>
-                        <ComposedChart data={cfData} margin={{top:4, right:12, left:0, bottom:0}}>
-                            <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" vertical={false} />
-                            <XAxis dataKey="label" tick={{fill:"rgba(232,244,241,0.35)", fontSize:9, fontFamily:"monospace"}} axisLine={false} tickLine={false} interval={3} />
-                            <YAxis tickFormatter={(v:number)=>`${v}%`} tick={{fill:"rgba(232,244,241,0.35)", fontSize:9, fontFamily:"monospace"}} axisLine={false} tickLine={false} width={38} domain={[0,100]} />
-                            <Tooltip content={<CustomTooltip />} />
-                            <Area type="monotone" dataKey="Solar CF"   stroke={SOURCE_COLORS.solar}   fill={SOURCE_COLORS.solar+"22"}  strokeWidth={2} dot={false} />
-                            <Line  type="monotone" dataKey="Wind CF"    stroke={SOURCE_COLORS.wind}    strokeWidth={1.5} dot={false} strokeDasharray="4 2" />
-                            <Line  type="monotone" dataKey="Hydro CF"   stroke={SOURCE_COLORS.hydro}   strokeWidth={1.5} dot={false} />
-                            <Line  type="monotone" dataKey="Thermal CF" stroke={SOURCE_COLORS.thermal} strokeWidth={1.5} dot={false} strokeDasharray="2 3" />
-                        </ComposedChart>
-                    </ResponsiveContainer>
-                    <div style={{marginTop:8, display:"flex", gap:12, flexWrap:"wrap"}}>
-                        {[{col:SOURCE_COLORS.solar,label:"Solar (bell curve)"}, {col:SOURCE_COLORS.wind,label:"Wind (slight diurnal)"}, {col:SOURCE_COLORS.hydro,label:"Hydro (dispatchable)"}, {col:SOURCE_COLORS.thermal,label:"Thermal (stable)"}].map(l=>(
-                            <div key={l.label} style={{display:"flex", alignItems:"center", gap:4, fontSize:10, color:"rgba(232,244,241,0.5)"}}>
-                                <div style={{width:12, height:2, background:l.col}} />{l.label}
-                            </div>
-                        ))}
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+                        <div style={S.lbl}>
+                            24-Hour Available Capacity — {selectedRegion==="ALL_INDIA"?"All India":REGIONS.find(r=>r.id===selectedRegion)?.label+" Region"}
+                            {weatherUsed && <span style={{color:"#ffd60a",fontWeight:600}}> · Weather adjusted</span>}
+                        </div>
+                        <div style={{display:"flex",gap:10}}>
+                            {SOURCES.map(s=>(
+                                <span key={s.key} style={{fontSize:10,color:"rgba(232,244,241,0.5)",display:"flex",alignItems:"center",gap:4}}>
+                  <span style={{width:8,height:8,borderRadius:2,background:s.color,display:"inline-block"}}/>
+                                    {s.label}
+                </span>
+                            ))}
+                        </div>
                     </div>
-                </div>
 
-                {/* Monthly renewable share */}
-                <div style={S.panel}>
-                    <div style={S.panelTitle}>Why Capacity Varies — Seasonal Logic</div>
-                    <div style={{display:"flex", flexDirection:"column", gap:10}}>
-                        {[
-                            {icon:"☀", color:SOURCE_COLORS.solar, title:"Solar", detail:"Bell curve: zero at night, peaks at 12:00. Pre-monsoon (Apr-Jun) highest. Monsoon 40-60% drop from cloud cover. Western region best (Rajasthan/Gujarat irradiance)."},
-                            {icon:"💨", color:SOURCE_COLORS.wind,  title:"Wind",  detail:"70% of annual output May-Sep (SW Monsoon). Western (Gujarat coast) and Southern (Tamil Nadu, Western Ghats) dominate. National average CUF ~18% (CERC 2022-23)."},
-                            {icon:"💧", color:SOURCE_COLORS.hydro,  title:"Hydro", detail:"Reservoir hydro peaks Oct-Nov (full reservoirs post-monsoon). Pre-monsoon (Apr-Jun) lowest. NE region run-of-river peaks during Jul-Aug monsoon."},
-                            {icon:"🔥", color:SOURCE_COLORS.thermal,title:"Thermal", detail:"Average PLF ~58% (CERC). Planned maintenance Mar-May. Coal-dominant regions (Eastern, Northern) most reliable. Forced outages ~0-8% random daily."},
-                        ].map(s=>(
-                            <div key={s.title} style={{display:"flex", gap:10, padding:"8px 10px", background:"rgba(255,255,255,0.02)", borderRadius:6, borderLeft:`3px solid ${s.color}`}}>
-                                <span style={{fontSize:16, flexShrink:0}}>{s.icon}</span>
-                                <div>
-                                    <div style={{fontSize:11, fontWeight:500, color:s.color, marginBottom:2}}>{s.title}</div>
-                                    <div style={{fontSize:10, color:"rgba(232,244,241,0.55)", lineHeight:1.5}}>{s.detail}</div>
+                    {/* Stacked hourly chart */}
+                    <div style={{display:"flex",alignItems:"flex-end",gap:4,height:220,marginBottom:6}}>
+                        {hourlyData.map((h:any) => {
+                            const isNow    = h.hour === nowHour;
+                            const isActive = activeHour === h.hour;
+                            const total    = h.total_available_mw || 1;
+                            const b        = h.breakdown_mw ?? {};
+                            return (
+                                <div key={h.hour} onMouseEnter={()=>setActiveHour(h.hour)} onMouseLeave={()=>setActiveHour(null)}
+                                     style={{flex:1, cursor:"pointer", height:"100%", display:"flex", flexDirection:"column-reverse",
+                                         outline: isNow?"1px solid rgba(255,255,255,0.3)":isActive?"1px solid rgba(255,255,255,0.15)":undefined,
+                                         borderRadius:2, opacity:(!isNow&&!isActive&&activeHour!=null)?0.65:1, transition:"opacity 0.15s"}}>
+                                    {SOURCES.map(s => {
+                                        const mw  = b[s.key] ?? 0;
+                                        const pct = mw / maxTotal * 100;
+                                        return pct > 0.2 ? (
+                                            <div key={s.key} title={`${s.label}: ${(mw/1000).toFixed(1)} GW`}
+                                                 style={{width:"100%",height:`${pct}%`,background:s.color,opacity:0.85,flexShrink:0}}/>
+                                        ) : null;
+                                    })}
                                 </div>
+                            );
+                        })}
+                    </div>
+
+                    {/* X-axis */}
+                    <div style={{display:"flex",gap:4}}>
+                        {hourlyData.map((h:any)=>(
+                            <div key={h.hour} style={{flex:1,textAlign:"center",fontSize:8,
+                                color:h.hour===nowHour?"#00d4aa":activeHour===h.hour?"rgba(232,244,241,0.6)":"rgba(232,244,241,0.3)",
+                                fontFamily:"monospace",fontWeight:h.hour===nowHour?700:400}}>
+                                {h.hour%3===0?`${h.hour}h`:""}
                             </div>
                         ))}
                     </div>
+
+                    {/* Weather strip (if weather used) */}
+                    {weatherUsed && (
+                        <div style={{marginTop:8,borderTop:"1px solid rgba(255,255,255,0.06)",paddingTop:6}}>
+                            <div style={{fontSize:9,color:"rgba(232,244,241,0.35)",marginBottom:4}}>☀ Solar irradiance (W/m²) — from Open-Meteo live weather</div>
+                            <div style={{display:"flex",alignItems:"flex-end",gap:4,height:30}}>
+                                {hourlyData.map((h:any) => {
+                                    const s = h.weather?.solar_wm2 ?? 0;
+                                    const pct = Math.min(s / 1000 * 100, 100);
+                                    return (
+                                        <div key={h.hour} style={{flex:1,height:`${pct}%`,background:"#ffd60a",opacity:0.6,borderRadius:"1px 1px 0 0",minHeight:1}}/>
+                                    );
+                                })}
+                            </div>
+                            <div style={{display:"flex",gap:4,marginTop:2}}>
+                                {hourlyData.map((h:any)=>(
+                                    <div key={h.hour} style={{flex:1,textAlign:"center",fontSize:7,color:"rgba(255,215,10,0.4)",fontFamily:"monospace"}}>
+                                        {h.weather?.temp_c!=null&&h.hour%3===0?`${Math.round(h.weather.temp_c)}°`:""}
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    )}
+                </div>
+
+                {/* Hour detail panel */}
+                <div style={S.panel}>
+                    {activeH ? (
+                        <>
+                            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+                                <div style={{fontFamily:"monospace",fontSize:22,fontWeight:700,color:"#00d4aa"}}>
+                                    {activeH.label}
+                                </div>
+                                {activeH.hour === nowHour && (
+                                    <div style={{fontSize:9,background:"rgba(0,212,170,0.1)",color:"#00d4aa",
+                                        border:"1px solid rgba(0,212,170,0.3)",borderRadius:4,padding:"2px 8px"}}>
+                                        NOW
+                                    </div>
+                                )}
+                            </div>
+
+                            <div style={{fontFamily:"monospace",fontSize:28,fontWeight:700,color:"#e8f4f1",marginBottom:2}}>
+                                {(activeH.total_available_mw/1000).toFixed(1)} GW
+                            </div>
+                            <div style={{fontSize:10,color:"rgba(232,244,241,0.4)",marginBottom:12}}>
+                                available · {activeH.renewable_pct?.toFixed(0)}% renewable
+                            </div>
+
+                            {/* Source breakdown */}
+                            <div style={S.lbl}>Source breakdown</div>
+                            <div style={{display:"flex",flexDirection:"column",gap:6,marginBottom:12}}>
+                                {SOURCES.map(s => {
+                                    const mw  = activeH.breakdown_mw?.[s.key] ?? 0;
+                                    if (mw < 10) return null;
+                                    const pct = mw / activeH.total_available_mw * 100;
+                                    return (
+                                        <div key={s.key}>
+                                            <div style={{display:"flex",justifyContent:"space-between",fontSize:10,color:"rgba(232,244,241,0.6)",marginBottom:2}}>
+                        <span style={{display:"flex",alignItems:"center",gap:6}}>
+                          <span style={{width:8,height:8,borderRadius:2,background:s.color,display:"inline-block"}}/>
+                            {s.label}
+                        </span>
+                                                <span style={{fontFamily:"monospace"}}>{(mw/1000).toFixed(1)} GW</span>
+                                            </div>
+                                            <div style={{height:5,background:"rgba(255,255,255,0.06)",borderRadius:3}}>
+                                                <div style={{height:"100%",width:`${pct}%`,background:s.color,opacity:0.8,borderRadius:3}}/>
+                                            </div>
+                                        </div>
+                                    );
+                                })}
+                            </div>
+
+                            {/* Weather at this hour */}
+                            {activeH.weather && (activeH.weather.temp_c != null || activeH.weather.solar_wm2 != null) && (
+                                <>
+                                    <div style={S.lbl}>Weather this hour</div>
+                                    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:6}}>
+                                        {[
+                                            {l:"Temp",  v:activeH.weather.temp_c!=null?`${activeH.weather.temp_c}°C`:"—",   c:"#ffb347"},
+                                            {l:"Solar", v:activeH.weather.solar_wm2!=null?`${activeH.weather.solar_wm2} W/m²`:"—", c:"#ffd60a"},
+                                            {l:"Wind",  v:activeH.weather.wind_ms!=null?`${activeH.weather.wind_ms} m/s`:"—",  c:"#4da6ff"},
+                                        ].map(m=>(
+                                            <div key={m.l} style={{background:"rgba(255,255,255,0.03)",borderRadius:5,padding:"6px 8px",textAlign:"center"}}>
+                                                <div style={{fontFamily:"monospace",fontSize:12,fontWeight:700,color:m.c}}>{m.v}</div>
+                                                <div style={{fontSize:9,color:"rgba(232,244,241,0.4)"}}>{m.l}</div>
+                                            </div>
+                                        ))}
+                                    </div>
+                                </>
+                            )}
+
+                            {activeH.alerts?.length > 0 && (
+                                <div style={{marginTop:10,fontSize:10,color:"#ffb347",background:"rgba(255,179,71,0.08)",
+                                    borderRadius:5,padding:"6px 8px",borderLeft:"3px solid #ffb347"}}>
+                                    {activeH.alerts[0]}
+                                </div>
+                            )}
+                        </>
+                    ) : (
+                        <div style={{height:"100%",display:"flex",flexDirection:"column",justifyContent:"center",alignItems:"center",gap:8,color:"rgba(232,244,241,0.25)"}}>
+                            <div style={{fontSize:32}}>👆</div>
+                            <div style={{fontSize:11,fontFamily:"monospace",textAlign:"center"}}>Hover a bar to see<br/>hourly breakdown</div>
+                        </div>
+                    )}
                 </div>
             </div>
 
-            {/* Active alerts */}
-            {currentRegionCap && currentRegionCap.alerts.length > 0 && (
-                <div style={{...S.panel, marginBottom:14}}>
-                    <div style={S.panelTitle}>Active Capacity Alerts — {REGIONS.find(r=>r.id===selectedRegion)?.label} Region</div>
-                    <div style={{display:"flex", flexDirection:"column", gap:6}}>
-                        {currentRegionCap.alerts.map((a,i)=>(
-                            <div key={i} style={{
-                                padding:"8px 12px", borderRadius:6, fontSize:11,
-                                background: a.includes("🔴")?"rgba(255,77,106,0.1)": a.includes("⚠")?"rgba(255,179,71,0.08)":"rgba(0,212,170,0.06)",
-                                color: a.includes("🔴")?"#ff4d6a": a.includes("⚠")?"#ffb347":"#00d4aa",
-                                border: `1px solid ${a.includes("🔴")?"rgba(255,77,106,0.3)": a.includes("⚠")?"rgba(255,179,71,0.2)":"rgba(0,212,170,0.15)"}`,
-                            }}>{a}</div>
-                        ))}
-                    </div>
+            {/* Bottom: source explanation */}
+            <div style={{...S.panel,background:"rgba(0,212,170,0.02)"}}>
+                <div style={S.lbl}>How Hourly Available Capacity Is Computed</div>
+                <div style={{display:"grid",gridTemplateColumns:"repeat(3,minmax(0,1fr))",gap:14}}>
+                    {[
+                        {icon:"🔥",color:"#ff6b35",title:"Thermal (Coal / Gas)",
+                            detail:"Constant across all 24 hours — thermal is base-load. Available = installed × seasonal availability factor (78-84%). Cooler at night = marginally better condenser efficiency. No artificial night-time reduction. Source: CEA Mar 2026."},
+                        {icon:"☀",color:"#ffd60a",title:"Solar",
+                            detail:"Zero before 05:00 and after 19:00. Bell-curve through daylight hours peaking at 12:00. When live Open-Meteo weather is available, solar output scales with actual irradiance (W/m²) rather than a clear-sky model. Monsoon months reduced 40–55%."},
+                        {icon:"💧",color:"#00d4aa",title:"Hydro · Wind · Nuclear",
+                            detail:"Hydro: seasonal (May snowmelt peak for Himalayan; Oct–Nov post-monsoon). Dispatchable reservoir hydro holds back 10% for peak hours. Wind: live wind speed from Open-Meteo scales output (capacity factor ∝ v³ / rated power). Nuclear: ~80% PLF, flat 24h."},
+                    ].map(s=>(
+                        <div key={s.title} style={{display:"flex",gap:10,padding:"10px 12px",background:"rgba(255,255,255,0.02)",borderRadius:6,borderLeft:`3px solid ${s.color}`}}>
+                            <span style={{fontSize:18,flexShrink:0}}>{s.icon}</span>
+                            <div>
+                                <div style={{fontSize:11,fontWeight:500,color:s.color,marginBottom:3}}>{s.title}</div>
+                                <div style={{fontSize:10,color:"rgba(232,244,241,0.5)",lineHeight:1.6}}>{s.detail}</div>
+                            </div>
+                        </div>
+                    ))}
                 </div>
-            )}
+            </div>
         </div>
     );
 }

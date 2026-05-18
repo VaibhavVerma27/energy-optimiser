@@ -125,13 +125,24 @@ export function DemandChart({ data, capacityMw, showLegend = true }: DemandChart
         weather_enhanced_cap: d.weather_enhanced_cap,
     }));
 
-    // Y-axis domain: tightly around the data range
-    const allVals = chartData.flatMap(d => [d.Demand, d.Capacity]).filter(Boolean) as number[];
-    const minVal  = allVals.length ? Math.min(...allVals) : 0;
-    const maxVal  = allVals.length ? Math.max(...allVals) : 1;
-    const pad     = (maxVal - minVal) * 0.08;
-    const yMin    = Math.floor((minVal - pad) / 1000) * 1000;
-    const yMax    = Math.ceil ((maxVal + pad) / 1000) * 1000;
+    // Y-axis: base range on DEMAND values only.
+    // Capacity (installed ~420-450 GW) is far above demand (~190-230 GW for All-India).
+    // Including capacity in the min/max calculation squashes the demand curve to 40% height.
+    const demandVals   = chartData.map(d => d.Demand).filter(Boolean) as number[];
+    const capacityVals = chartData.map(d => d.Capacity).filter(Boolean) as number[];
+    const ciLows2      = hasCI2 ? chartData.map(d => d.ci_lower).filter(Boolean) as number[] : [];
+    const demandMin    = demandVals.length ? Math.min(...demandVals, ...ciLows2) : 0;
+    const demandMax    = demandVals.length ? Math.max(...demandVals)             : 1;
+    const capMax       = capacityVals.length ? Math.max(...capacityVals)        : demandMax;
+    const swing        = demandMax - demandMin;
+    const pad          = Math.max(swing * 0.12, 2000);
+    // Cap axis top: if capacity is very high (e.g. 450 GW vs 210 GW demand),
+    // only extend axis to demandMax + 60% of swing so demand curve stays prominent
+    const yMin  = Math.floor((demandMin - pad) / 2000) * 2000;
+    const yMax  = Math.ceil((Math.min(capMax, demandMax + swing * 0.6) + pad) / 2000) * 2000;
+    const useGW = demandMax > 50_000;
+    const fmtY  = (v: number) => useGW ? `${(v / 1000).toFixed(1)}` : `${(v / 1000).toFixed(0)}K`;
+    const yLabel = useGW ? "GW" : "";
 
     // Find overload hours for dot markers
     const overloadHours = chartData
@@ -184,12 +195,16 @@ export function DemandChart({ data, capacityMw, showLegend = true }: DemandChart
                         interval={3}
                     />
                     <YAxis
-                        tickFormatter={(v: number) => `${(v / 1000).toFixed(0)}K`}
+                        tickFormatter={fmtY}
                         tick={{ fill: "rgba(232,244,241,0.4)", fontSize: 9, fontFamily: "monospace" }}
                         axisLine={false}
                         tickLine={false}
                         domain={[yMin, yMax]}
-                        width={38}
+                        width={useGW ? 44 : 38}
+                        label={useGW ? {
+                            value: "GW", angle: -90, position: "insideLeft",
+                            fill: "rgba(232,244,241,0.25)", fontSize: 9, dx: 10,
+                        } : undefined}
                     />
                     <Tooltip content={<CustomTooltip />} />
 
